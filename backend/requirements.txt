@@ -1,0 +1,41 @@
+# FastAPI and web server
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.12
+
+# Database
+sqlalchemy==2.0.36
+pymysql==1.1.1
+cryptography==44.0.0
+
+# Pydantic
+pydantic==2.9.2
+pydantic-settings==2.5.2
+
+# PDF processing
+pypdfium2==4.30.0
+Pillow==11.0.0
+
+# Computer Vision (placeholders - install when ready)
+opencv-python==4.10.0.84
+numpy==1.26.4
+
+# OCR (placeholder - install when ready)
+# paddlepaddle==2.6.1
+# paddleocr==2.7.3
+
+# YOLO (placeholder - install when ready)
+# ultralytics==8.3.0
+# torch==2.4.0
+# torchvision==0.19.0
+
+# LLM
+requests==2.32.3
+
+# Data export
+pandas==2.2.3
+openpyxl==3.1.5
+
+# Utilities
+python-dotenv==1.0.1
+
