@@ -2,6 +2,7 @@
 LLM-based receipt field extraction using Ollama.
 """
 import json
+import re
 import requests
 import logging
 from typing import Dict, Any, Optional
@@ -20,25 +21,98 @@ def extract_fields_llm(ocr_text: str) -> Dict[str, Any]:
     Returns:
         Dictionary with extracted fields
     """
-    prompt = f"""Extract structured data from the following receipt text. 
-Return ONLY a valid JSON object with these fields:
-- merchant_name (string)
-- date (string, format: YYYY-MM-DD if possible)
-- total_amount (float)
-- tax_amount (float, optional)
-- subtotal (float, optional)
-- currency (string, 3-letter code like EUR, USD, GBP, optional)
-- items (array of objects with: name, quantity, price, total)
-- payment_method (string, optional)
-- address (string, optional)
-- phone (string, optional)
-- vat_amount (float, optional)
-- vat_percentage (float, optional)
+    prompt = f"""You are a receipt data extraction expert. Extract structured data from the following receipt text (which may contain OCR errors).
 
-Receipt text:
+CRITICAL JSON FORMATTING RULES:
+1. Use `null` (not `null.00`, `null.0`, or any other variant) for missing/unknown values
+2. Use proper JSON syntax: no trailing commas, proper quotes, etc.
+3. Return ONLY valid JSON, no markdown code blocks, no explanations, no additional text
+4. All numbers must be valid floats (e.g., 9.72, not "9,72" or "€9.72")
+5. Dates should be in YYYY-MM-DD format if possible, otherwise use the original format as string
+
+REQUIRED JSON SCHEMA:
+{{
+  "merchant_name": "string or null",
+  "date": "string (YYYY-MM-DD preferred) or null",
+  "total_amount": float or null,
+  "tax_amount": float or null,
+  "subtotal": float or null,
+  "currency": "string (3-letter code: EUR, USD, GBP, etc.) or null",
+  "items": [{{"name": "string", "quantity": float, "price": float, "total": float}}] or [],
+  "payment_method": "string or null",
+  "address": "string or null",
+  "phone": "string or null",
+  "vat_amount": float or null,
+  "vat_percentage": float or null
+}}
+
+EXTRACTION GUIDELINES:
+
+1. MERCHANT_NAME: Extract the store/company name (usually at the top). Common Dutch stores: Albert Heijn (AH), Jumbo, Plus, Coop, etc.
+
+2. DATE: 
+   - Dutch format: "15-07-2022" or "15/07/2022" → convert to "2022-07-15"
+   - English format: "Jul 15, 2022" → convert to "2022-07-15"
+   - If unclear, keep original format as string
+   - Look for keywords: "Datum", "Date", "Bon datum"
+
+3. TOTAL_AMOUNT: 
+   - Look for "Totaal", "Total", "Totaalbedrag", "Eindtotaal", "Totaal incl. BTW"
+   - Remove currency symbols (€, EUR, etc.) and commas used as decimal separators
+   - Convert "9,72" to 9.72, "€12.50" to 12.50
+
+4. TAX_AMOUNT / VAT_AMOUNT:
+   - Dutch receipts use "BTW" (Belasting Toegevoegde Waarde)
+   - Look for "BTW", "VAT", "Tax", "Belasting"
+   - Can be same as tax_amount field
+
+5. CURRENCY:
+   - Default to "EUR" for Dutch receipts (Netherlands uses Euro)
+   - Look for currency symbols: € = EUR, $ = USD, £ = GBP
+   - If not found but receipt is clearly Dutch, use "EUR"
+
+6. ITEMS:
+   - Extract line items if clearly listed
+   - Each item: name, quantity (if shown), price per unit, total
+   - If items are not clearly separated, use empty array []
+
+7. PAYMENT_METHOD:
+   - Look for: "Contant", "Cash", "PIN", "Debit", "Credit Card", "Creditcard", "iDEAL", etc.
+
+8. ADDRESS: Full store address if available
+
+9. PHONE: Phone number in any format
+
+10. VAT_PERCENTAGE:
+    - Common Dutch VAT rates: 9% (low rate), 21% (standard rate)
+    - Calculate if you have tax_amount and total_amount: (tax_amount / (total_amount - tax_amount)) * 100
+
+HANDLING OCR ERRORS:
+- If text is unclear or garbled, use null for that field
+- Try to infer from context (e.g., "AH" likely means "Albert Heijn")
+- Numbers with OCR errors: if clearly a number but some digits are wrong, use your best interpretation
+
+EXAMPLE OUTPUT:
+{{
+  "merchant_name": "Albert Heijn",
+  "date": "2022-07-15",
+  "total_amount": 9.72,
+  "tax_amount": 1.68,
+  "subtotal": 8.04,
+  "currency": "EUR",
+  "items": [{{"name": "Brood", "quantity": 1, "price": 2.50, "total": 2.50}}, {{"name": "Melk", "quantity": 2, "price": 1.25, "total": 2.50}}],
+  "payment_method": "PIN",
+  "address": "Hoofdstraat 123, Amsterdam",
+  "phone": null,
+  "vat_amount": 1.68,
+  "vat_percentage": 21.0
+}}
+
+NOW EXTRACT DATA FROM THIS RECEIPT TEXT:
+
 {ocr_text}
 
-Return ONLY the JSON object, no other text:"""
+Return ONLY the JSON object (no markdown, no code blocks, no explanations):"""
 
     try:
         # Check if model exists, use fallback if not
@@ -83,17 +157,72 @@ Return ONLY the JSON object, no other text:"""
         elif "```" in response_text:
             response_text = response_text.split("```")[1].split("```")[0].strip()
         
-        # Parse JSON
+        # Log raw response for debugging (first 500 chars)
+        logger.debug(f"LLM raw response (first 500 chars): {response_text[:500]}")
+        
+        # Parse JSON with multiple fallback strategies
+        extracted_data = None
+        json_parse_errors = []
+        
+        # Strategy 1: Direct parse
         try:
             extracted_data = json.loads(response_text)
-        except json.JSONDecodeError:
-            # Fallback: try to find JSON object in text
-            start_idx = response_text.find("{")
-            end_idx = response_text.rfind("}") + 1
-            if start_idx >= 0 and end_idx > start_idx:
-                extracted_data = json.loads(response_text[start_idx:end_idx])
-            else:
-                raise ValueError("Could not parse JSON from LLM response")
+        except json.JSONDecodeError as e:
+            json_parse_errors.append(f"Direct parse: {str(e)}")
+        
+        # Strategy 2: Find JSON object boundaries
+        if extracted_data is None:
+            try:
+                start_idx = response_text.find("{")
+                end_idx = response_text.rfind("}") + 1
+                if start_idx >= 0 and end_idx > start_idx:
+                    extracted_data = json.loads(response_text[start_idx:end_idx])
+            except json.JSONDecodeError as e:
+                json_parse_errors.append(f"Boundary parse: {str(e)}")
+        
+        # Strategy 3: Try to fix common JSON issues
+        if extracted_data is None:
+            try:
+                # Remove trailing commas before closing braces/brackets
+                fixed_text = re.sub(r',\s*}', '}', response_text)
+                fixed_text = re.sub(r',\s*]', ']', fixed_text)
+                # Fix invalid null.00, null.0, etc. -> null
+                fixed_text = re.sub(r'\bnull\.\d+\b', 'null', fixed_text)
+                # Try parsing again
+                start_idx = fixed_text.find("{")
+                end_idx = fixed_text.rfind("}") + 1
+                if start_idx >= 0 and end_idx > start_idx:
+                    extracted_data = json.loads(fixed_text[start_idx:end_idx])
+            except (json.JSONDecodeError, Exception) as e:
+                json_parse_errors.append(f"Fixed parse: {str(e)}")
+        
+        # Strategy 4: Try to extract just the JSON part line by line
+        if extracted_data is None:
+            try:
+                lines = response_text.split('\n')
+                json_lines = []
+                in_json = False
+                for line in lines:
+                    if '{' in line:
+                        in_json = True
+                    if in_json:
+                        json_lines.append(line)
+                    if in_json and '}' in line:
+                        break
+                if json_lines:
+                    json_text = '\n'.join(json_lines)
+                    # Remove trailing commas
+                    json_text = re.sub(r',\s*}', '}', json_text)
+                    json_text = re.sub(r',\s*]', ']', json_text)
+                    extracted_data = json.loads(json_text)
+            except (json.JSONDecodeError, Exception) as e:
+                json_parse_errors.append(f"Line-by-line parse: {str(e)}")
+        
+        if extracted_data is None:
+            error_details = "; ".join(json_parse_errors)
+            logger.error(f"All JSON parsing strategies failed. Errors: {error_details}")
+            logger.error(f"Response text (first 1000 chars): {response_text[:1000]}")
+            raise ValueError(f"Could not parse JSON from LLM response. Last error: {json_parse_errors[-1] if json_parse_errors else 'Unknown'}")
         
         # Validate and clean extracted data
         return validate_extracted_fields(extracted_data)

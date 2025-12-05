@@ -70,19 +70,48 @@ def run_ocr(image_path: Path) -> str:
                 # PaddleOCR 3.x returns OCRResult objects (dict-like)
                 ocr_result = result[0]
                 
-                # Extract text from rec_texts field
+                # Try multiple methods to extract text
+                extracted_text = None
+                
+                # Method 1: Extract from rec_texts field (preferred)
                 rec_texts = ocr_result.get('rec_texts', [])
                 if rec_texts and isinstance(rec_texts, list):
-                    # Join all recognized text lines
                     extracted_text = '\n'.join(str(text) for text in rec_texts if text)
-                    logger.debug(f"PaddleOCR extracted {len(rec_texts)} text segments, {len(extracted_text)} characters")
+                    logger.debug(f"PaddleOCR extracted {len(rec_texts)} text segments from rec_texts, {len(extracted_text)} characters")
+                
+                # Method 2: Try to extract from dt_polys or other fields if rec_texts is missing
+                if not extracted_text or not extracted_text.strip():
+                    # Check if result has a different structure (older PaddleOCR versions)
+                    if isinstance(ocr_result, (list, tuple)):
+                        # Old format: list of [bbox, (text, confidence)]
+                        text_lines = []
+                        for item in ocr_result:
+                            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                                text_info = item[1]
+                                if isinstance(text_info, (list, tuple)) and len(text_info) > 0:
+                                    text_lines.append(str(text_info[0]))
+                        if text_lines:
+                            extracted_text = '\n'.join(text_lines)
+                            logger.debug(f"PaddleOCR extracted {len(text_lines)} text lines from old format")
                     
-                    if extracted_text.strip():
-                        return extracted_text.strip()
-                    else:
-                        logger.warning("PaddleOCR returned empty text")
+                    # Method 3: Try to get text from any text-related fields
+                    if not extracted_text or not extracted_text.strip():
+                        # Check for other possible text fields
+                        for key in ['text', 'ocr_text', 'detected_text', 'lines']:
+                            if key in ocr_result:
+                                value = ocr_result[key]
+                                if isinstance(value, list):
+                                    extracted_text = '\n'.join(str(v) for v in value if v)
+                                elif isinstance(value, str):
+                                    extracted_text = value
+                                if extracted_text and extracted_text.strip():
+                                    logger.debug(f"PaddleOCR extracted text from {key} field")
+                                    break
+                
+                if extracted_text and extracted_text.strip():
+                    return extracted_text.strip()
                 else:
-                    logger.warning("PaddleOCR result missing rec_texts field")
+                    logger.warning("PaddleOCR returned empty or no text")
             else:
                 logger.warning("PaddleOCR returned no results")
                 
@@ -96,14 +125,25 @@ def run_ocr(image_path: Path) -> str:
         from PIL import Image
         logger.debug(f"Falling back to pytesseract for: {image_path}")
         img = Image.open(image_path)
-        text = pytesseract.image_to_string(img, lang='nld+eng')  # Dutch + English
+        # Try Dutch+English, fallback to English only if Dutch not available
+        try:
+            text = pytesseract.image_to_string(img, lang='nld+eng')
+        except Exception:
+            # If Dutch language pack not available, use English only
+            text = pytesseract.image_to_string(img, lang='eng')
         if text.strip():
             logger.debug(f"pytesseract extracted {len(text)} characters")
             return text.strip()
     except ImportError:
-        logger.debug("pytesseract not available")
+        # pytesseract not installed - this is optional, only log at debug level
+        logger.debug("pytesseract not available (optional dependency)")
     except Exception as e:
-        logger.warning(f"pytesseract error: {str(e)}")
+        # Check if it's a "not installed" error vs other error
+        error_str = str(e).lower()
+        if 'tesseract' in error_str and ('not installed' in error_str or 'not found' in error_str):
+            logger.debug(f"pytesseract/tesseract not installed: {str(e)}")
+        else:
+            logger.warning(f"pytesseract error: {str(e)}")
     
     # Final fallback: return placeholder with image info
     logger.warning(f"Using placeholder OCR text for: {image_path.name}")

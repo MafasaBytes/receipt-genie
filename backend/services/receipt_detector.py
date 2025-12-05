@@ -1,12 +1,14 @@
 """
-Classical computer vision-based receipt detection service.
-Designed for faint, greyish, low-contrast Dutch receipts on A4 pages.
+Advanced classical computer vision-based receipt detection service.
+Designed for faint, greyish, low-contrast Dutch receipts with auto-deskew,
+orientation correction, and multi-receipt slicing.
 """
 from pathlib import Path
-from typing import List
+from typing import List, Tuple
 import cv2
 import numpy as np
 import logging
+import uuid
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -14,10 +16,15 @@ logger = logging.getLogger(__name__)
 
 def detect_receipts(image_path: Path) -> List[str]:
     """
-    Detect and extract receipts from an image using classical CV techniques.
+    Detect and extract receipts from an image using advanced CV techniques.
     
-    Designed for faint, greyish, low-contrast receipts on A4 pages.
-    Uses contour detection with perspective correction.
+    Features:
+    - Auto-deskew
+    - Brightness/contrast normalization
+    - Edge-boost filtering
+    - Automatic orientation correction
+    - Multi-receipt slicing for stacked receipts
+    - Robust detection for faint, low-contrast receipts
     
     Args:
         image_path: Path to the image file
@@ -27,205 +34,540 @@ def detect_receipts(image_path: Path) -> List[str]:
         If no receipt is detected, returns [image_path] as fallback.
     """
     try:
-        # Step 1: Load image
+        # Step 1: Load & Preprocess
+        logger.info(f"Loading image: {image_path}")
         img = cv2.imread(str(image_path))
         if img is None:
             logger.warning(f"Could not load image: {image_path}")
-            return [str(image_path)]  # Fallback to original
+            return [str(image_path)]
         
         original_img = img.copy()
         height, width = img.shape[:2]
-        logger.debug(f"Processing image: {width}x{height}")
+        logger.debug(f"Original image size: {width}x{height}")
         
-        # Step 2: Convert to grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        # Preprocess image
+        preprocessed = preprocess_image(img)
         
-        # Step 3: Apply Gaussian blur
-        blur = cv2.GaussianBlur(gray, (5, 5), 0)
+        # Step 2: Auto-deskew
+        logger.debug("Applying auto-deskew...")
+        deskewed = deskew(preprocessed)
         
-        # Step 4: Adaptive threshold
-        thresh = cv2.adaptiveThreshold(
-            blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-            cv2.THRESH_BINARY_INV, 51, 7
-        )
+        # Step 3: Orientation correction
+        logger.debug("Fixing orientation...")
+        oriented = fix_orientation(deskewed)
         
-        # Step 5: Morphology close to highlight borders
-        kernel = np.ones((5, 5), np.uint8)
-        morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
-        
-        # Step 6: Canny edge detection
-        edges = cv2.Canny(morph, 50, 200)
-        
-        # Step 7: Find external contours
-        contours, _ = cv2.findContours(
-            edges, 
-            cv2.RETR_EXTERNAL, 
-            cv2.CHAIN_APPROX_SIMPLE
-        )
+        # Step 4: Extract contours for stacked receipts
+        logger.info("=" * 60)
+        logger.info("EXTRACTING CONTOURS")
+        logger.info("=" * 60)
+        contours = extract_contours(oriented)
         
         if not contours:
             logger.warning(f"No contours found in {image_path}, using fallback")
             return [str(image_path)]
         
-        # Step 8: Filter contours by area and aspect ratio
-        image_area = height * width
-        valid_contours = []
-        rejected_contours = []
-        total_contours = len(contours)
+        logger.info(f"Found {len(contours)} potential receipt regions after filtering")
         
-        logger.info(f"Found {total_contours} total contours in image")
+        # Step 5: Multi-receipt slicing and cropping
+        crops_dir = settings.TEMP_DIR / "crops"
+        crops_dir.mkdir(parents=True, exist_ok=True)
         
-        for contour in contours:
-            # Calculate area ratio
-            contour_area = cv2.contourArea(contour)
-            area_ratio = contour_area / image_area
-            
-            # Get bounding rectangle
-            x, y, w, h = cv2.boundingRect(contour)
-            aspect_ratio = h / w if w > 0 else 0
-            
-            # Filter criteria:
-            # - Area between 2% and 95% of image (relaxed for multiple receipts per page)
-            #   (2% allows for smaller receipts when multiple are present)
-            # - Tall shape: height > width (aspect ratio > 1.0, relaxed from 1.5)
-            #   OR reasonable size (for receipts that might be rotated or square-ish)
-            
-            rejection_reason = None
-            if area_ratio <= 0.02:
-                rejection_reason = f"too small (area={area_ratio*100:.2f}% < 2%)"
-            elif area_ratio >= 0.95:
-                rejection_reason = f"too large (area={area_ratio*100:.2f}% > 95%)"
-            elif aspect_ratio <= 1.0 and area_ratio <= 0.1:
-                rejection_reason = f"wrong aspect ratio (h/w={aspect_ratio:.2f}, area={area_ratio*100:.2f}%)"
-            
-            if rejection_reason:
-                rejected_contours.append((contour, area_ratio, aspect_ratio, rejection_reason))
-            else:
-                valid_contours.append((contour, contour_area, x, y, w, h))
-                logger.debug(f"Valid contour: area={area_ratio*100:.2f}%, aspect={aspect_ratio:.2f}, bbox=({x},{y},{w},{h})")
-        
-        logger.info(f"Contour filtering: {len(valid_contours)} valid, {len(rejected_contours)} rejected out of {total_contours} total")
-        if rejected_contours and logger.isEnabledFor(logging.DEBUG):
-            for idx, (_, area_ratio, aspect_ratio, reason) in enumerate(rejected_contours[:5], 1):  # Log first 5
-                logger.debug(f"  Rejected contour {idx}: {reason} (area={area_ratio*100:.2f}%, aspect={aspect_ratio:.2f})")
-        
-        if not valid_contours:
-            logger.warning(f"No valid contours found in {image_path}, using fallback")
-            return [str(image_path)]
-        
-        # Step 9: Sort contours by area (largest first) and filter overlapping ones
-        valid_contours.sort(key=lambda x: x[1], reverse=True)  # Sort by area
-        
-        # Step 10: Filter out overlapping contours (non-maximum suppression)
-        # Keep only contours that don't significantly overlap with larger ones
-        filtered_contours = []
-        overlapping_count = 0
-        for i, (contour, area, x, y, w, h) in enumerate(valid_contours):
-            # Calculate intersection over union (IoU) with already selected contours
-            is_overlapping = False
-            for selected_contour, selected_area, sx, sy, sw, sh in filtered_contours:
-                # Calculate intersection
-                x1 = max(x, sx)
-                y1 = max(y, sy)
-                x2 = min(x + w, sx + sw)
-                y2 = min(y + h, sy + sh)
-                
-                if x2 > x1 and y2 > y1:
-                    intersection = (x2 - x1) * (y2 - y1)
-                    union = area + selected_area - intersection
-                    iou = intersection / union if union > 0 else 0
-                    
-                    # If IoU > 0.3, consider it overlapping and skip
-                    if iou > 0.3:
-                        is_overlapping = True
-                        overlapping_count += 1
-                        logger.debug(f"Contour {i+1} overlaps with larger contour (IoU={iou:.2f}), skipping")
-                        break
-            
-            if not is_overlapping:
-                filtered_contours.append((contour, area, x, y, w, h))
-                logger.info(f"Found receipt contour {len(filtered_contours)}: area={area:.0f}, bbox=({x},{y},{w},{h})")
-        
-        if overlapping_count > 0:
-            logger.info(f"Non-maximum suppression: {overlapping_count} overlapping contours removed, {len(filtered_contours)} unique receipts detected")
-        
-        if not filtered_contours:
-            logger.warning(f"No non-overlapping contours found in {image_path}, using fallback")
-            return [str(image_path)]
-        
-        # Step 11: Process each detected receipt contour
         cropped_paths = []
-        for receipt_idx, (contour, area, bx, by, bw, bh) in enumerate(filtered_contours):
+        rejected_regions = []
+        
+        # Sort contours by Y-coordinate (top to bottom)
+        sorted_contours = sort_contours_by_position(contours, oriented.shape[:2])
+        
+        logger.info("=" * 60)
+        logger.info("PROCESSING CONTOURS")
+        logger.info("=" * 60)
+        
+        for idx, contour in enumerate(sorted_contours):
             try:
-                # Approximate contour to polygon
-                epsilon = 0.02 * cv2.arcLength(contour, True)
-                approx = cv2.approxPolyDP(contour, epsilon, True)
+                # Get bounding rectangle
+                x, y, w, h = cv2.boundingRect(contour)
+                img_area = oriented.shape[0] * oriented.shape[1]
+                contour_area = cv2.contourArea(contour)
+                area_ratio = contour_area / img_area
                 
-                # Get four corner points for perspective transform
-                # If we have 4 points, use them; otherwise use bounding box corners
-                if len(approx) == 4:
-                    # Reorder points to: top-left, top-right, bottom-right, bottom-left
-                    pts = approx.reshape(4, 2)
-                    rect = order_points(pts)
-                else:
-                    # Use bounding box corners if approximation doesn't give 4 points
-                    logger.debug(f"Receipt {receipt_idx + 1}: Contour approximation didn't yield 4 points, using bounding box")
-                    rect = np.array([
-                        [bx, by],           # top-left
-                        [bx + bw, by],      # top-right
-                        [bx + bw, by + bh], # bottom-right
-                        [bx, by + bh]       # bottom-left
-                    ], dtype=np.float32)
+                logger.info(f"Processing contour {idx + 1}/{len(sorted_contours)}: bbox=({x},{y},{w},{h}), area={area_ratio*100:.2f}%")
                 
-                # Calculate dimensions for warped image
-                width_a = np.sqrt(((rect[2][0] - rect[3][0]) ** 2) + ((rect[2][1] - rect[3][1]) ** 2))
-                width_b = np.sqrt(((rect[1][0] - rect[0][0]) ** 2) + ((rect[1][1] - rect[0][1]) ** 2))
-                max_width = max(int(width_a), int(width_b))
-                
-                height_a = np.sqrt(((rect[1][0] - rect[2][0]) ** 2) + ((rect[1][1] - rect[2][1]) ** 2))
-                height_b = np.sqrt(((rect[0][0] - rect[3][0]) ** 2) + ((rect[0][1] - rect[3][1]) ** 2))
-                max_height = max(int(height_a), int(height_b))
-                
-                # Skip if dimensions are too small (likely noise)
-                if max_width < 100 or max_height < 100:
-                    logger.debug(f"Receipt {receipt_idx + 1}: Dimensions too small ({max_width}x{max_height}), skipping")
+                # Additional filtering (very relaxed criteria for faint receipts)
+                if area_ratio < 0.002:  # 0.2% minimum area (very relaxed)
+                    reason = f"area ratio too small ({area_ratio*100:.2f}% < 0.2%)"
+                    logger.warning(f"  REJECTED: {reason}")
+                    rejected_regions.append({"contour": idx + 1, "reason": reason, "area_ratio": area_ratio})
                     continue
                 
-                # Define destination points for perspective transform
-                dst = np.array([
-                    [0, 0],
-                    [max_width - 1, 0],
-                    [max_width - 1, max_height - 1],
-                    [0, max_height - 1]
-                ], dtype=np.float32)
+                if area_ratio > 0.95:
+                    reason = f"area ratio too large ({area_ratio*100:.2f}% > 95%)"
+                    logger.warning(f"  REJECTED: {reason}")
+                    rejected_regions.append({"contour": idx + 1, "reason": reason, "area_ratio": area_ratio})
+                    continue
                 
-                # Get perspective transform matrix and warp
-                M = cv2.getPerspectiveTransform(rect, dst)
-                warped = cv2.warpPerspective(original_img, M, (max_width, max_height))
+                # Extract region
+                region = oriented[y:y+h, x:x+w]
                 
-                # Save cropped receipt with index
-                output_path = image_path.parent / f"{image_path.stem}_receipt_{receipt_idx + 1}_cropped.png"
-                cv2.imwrite(str(output_path), warped)
-                logger.info(f"Saved cropped receipt {receipt_idx + 1} to: {output_path}")
-                cropped_paths.append(str(output_path))
+                if region.size == 0:
+                    reason = "extracted region is empty"
+                    logger.warning(f"  REJECTED: {reason}")
+                    rejected_regions.append({"contour": idx + 1, "reason": reason})
+                    continue
                 
+                # Check if region needs slicing (covers > 70% of page height - relaxed from 80%)
+                if h > oriented.shape[0] * 0.70:
+                    logger.info(f"  Large region detected ({h}px height, {h/oriented.shape[0]*100:.1f}% of page), attempting slicing...")
+                    slices = slice_receipt_region(region)
+                    
+                    if len(slices) == 0:
+                        reason = "slicing produced no valid slices"
+                        logger.warning(f"  REJECTED: {reason}")
+                        rejected_regions.append({"contour": idx + 1, "reason": reason})
+                        continue
+                    
+                    logger.info(f"  Sliced into {len(slices)} receipt(s)")
+                    for slice_idx, slice_img in enumerate(slices):
+                        if slice_img.size > 0:
+                            crop_path = save_crop(slice_img, crops_dir, f"{image_path.stem}_region_{idx}_slice_{slice_idx}")
+                            cropped_paths.append(crop_path)
+                            logger.info(f"  ✓ Saved slice {slice_idx + 1}/{len(slices)}: {Path(crop_path).name}")
+                        else:
+                            logger.warning(f"  REJECTED slice {slice_idx + 1}: empty slice")
+                else:
+                    # Single receipt in this region
+                    crop_path = save_crop(region, crops_dir, f"{image_path.stem}_region_{idx}")
+                    cropped_paths.append(crop_path)
+                    logger.info(f"  ✓ Saved receipt: {Path(crop_path).name}")
+                    
             except Exception as e:
-                logger.error(f"Error processing receipt contour {receipt_idx + 1}: {str(e)}")
-                logger.exception("Contour processing error details:")
+                reason = f"processing error: {str(e)}"
+                logger.error(f"  REJECTED contour {idx + 1}: {reason}")
+                logger.exception("Error details:")
+                rejected_regions.append({"contour": idx + 1, "reason": reason})
                 continue
         
+        # Summary logging
+        logger.info("=" * 60)
+        logger.info("DETECTION SUMMARY")
+        logger.info("=" * 60)
+        logger.info(f"Total contours processed: {len(sorted_contours)}")
+        logger.info(f"Successfully extracted: {len(cropped_paths)} receipt(s)")
+        logger.info(f"Rejected regions: {len(rejected_regions)}")
+        
+        if rejected_regions:
+            logger.warning("Rejected regions details:")
+            rejection_reasons_summary = {}
+            for r in rejected_regions:
+                reason_type = r["reason"].split(":")[0] if ":" in r["reason"] else r["reason"]
+                rejection_reasons_summary[reason_type] = rejection_reasons_summary.get(reason_type, 0) + 1
+                logger.warning(f"  Contour {r['contour']}: {r['reason']}")
+            
+            logger.warning(f"Rejection summary: {rejection_reasons_summary}")
+        
+        logger.info("=" * 60)
+        
         if not cropped_paths:
-            logger.warning(f"Failed to process any receipts from {image_path}, using fallback")
+            logger.warning(f"No valid receipts extracted from {image_path}, using fallback")
             return [str(image_path)]
         
-        logger.info(f"Successfully detected and cropped {len(cropped_paths)} receipt(s) from {image_path}")
+        logger.info(f"Successfully extracted {len(cropped_paths)} receipt(s) from {image_path}")
         return cropped_paths
         
     except Exception as e:
         logger.error(f"Error in receipt detection: {str(e)}")
         logger.exception("Full traceback:")
-        # Fallback: return original image path
         return [str(image_path)]
+
+
+def preprocess_image(img: np.ndarray) -> np.ndarray:
+    """
+    Step 1: Load & Preprocess
+    - Convert to grayscale
+    - Apply CLAHE for brightness normalization
+    - Apply contrast stretching
+    - Apply edge-boost filter
+    """
+    # Convert to grayscale
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    
+    # Apply CLAHE (Contrast Limited Adaptive Histogram Equalization)
+    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(8, 8))
+    equalized = clahe.apply(gray)
+    
+    # Normalize contrast
+    normalized = cv2.normalize(equalized, None, 0, 255, cv2.NORM_MINMAX)
+    
+    # Apply edge-boost filter
+    kernel = np.array([[-1, -1, -1],
+                       [-1,  9, -1],
+                       [-1, -1, -1]], dtype=np.float32)
+    edge_boosted = cv2.filter2D(normalized, -1, kernel)
+    
+    # Clip values to valid range
+    edge_boosted = np.clip(edge_boosted, 0, 255).astype(np.uint8)
+    
+    return edge_boosted
+
+
+def deskew(image: np.ndarray) -> np.ndarray:
+    """
+    Step 2: Auto-deskew using HoughLines-based angle estimation.
+    
+    Detects rotation angle and rotates image to correct skew.
+    """
+    # Apply Canny edge detection
+    edges = cv2.Canny(image, 50, 200, apertureSize=3)
+    
+    # Detect lines using HoughLines
+    lines = cv2.HoughLines(edges, 1, np.pi / 180, 200)
+    
+    if lines is None or len(lines) == 0:
+        logger.debug("No lines detected for deskew, returning original")
+        return image
+    
+    # Calculate angles
+    angles = []
+    for line in lines:
+        rho, theta = line[0]
+        # Convert to degrees
+        angle = np.degrees(theta) - 90
+        # Filter out near-vertical lines (they don't indicate skew)
+        if abs(angle) < 45:
+            angles.append(angle)
+    
+    if not angles:
+        logger.debug("No valid angles found for deskew")
+        return image
+    
+    # Compute median angle (more robust than mean)
+    median_angle = np.median(angles)
+    
+    # Only deskew if angle is significant (> 2 degrees)
+    if abs(median_angle) > 2:
+        logger.info(f"Deskewing image by {median_angle:.2f} degrees")
+        
+        # Get rotation matrix
+        (h, w) = image.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, median_angle, 1.0)
+        
+        # Calculate new dimensions
+        cos = np.abs(M[0, 0])
+        sin = np.abs(M[0, 1])
+        new_w = int((h * sin) + (w * cos))
+        new_h = int((h * cos) + (w * sin))
+        
+        # Adjust rotation matrix for new dimensions
+        M[0, 2] += (new_w / 2) - center[0]
+        M[1, 2] += (new_h / 2) - center[1]
+        
+        # Rotate image
+        deskewed = cv2.warpAffine(image, M, (new_w, new_h), 
+                                  flags=cv2.INTER_CUBIC,
+                                  borderMode=cv2.BORDER_REPLICATE)
+        return deskewed
+    
+    logger.debug(f"Skew angle {median_angle:.2f} degrees is acceptable, skipping deskew")
+    return image
+
+
+def fix_orientation(image: np.ndarray) -> np.ndarray:
+    """
+    Step 3: Orientation correction.
+    
+    Ensures receipt is portrait-oriented (height > width).
+    Uses text density analysis for better detection.
+    """
+    h, w = image.shape[:2]
+    
+    # Initial check: if landscape, rotate
+    if h < w * 0.8:
+        logger.debug("Image appears landscape, rotating 90° clockwise")
+        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+        h, w = image.shape[:2]
+    
+    # Text density check using horizontal projection
+    # Receipts typically have more text density in horizontal direction
+    horizontal_projection = cv2.reduce(image, 1, cv2.REDUCE_SUM, dtype=cv2.CV_32F)
+    vertical_projection = cv2.reduce(image, 0, cv2.REDUCE_SUM, dtype=cv2.CV_32F)
+    
+    # Calculate variance (text density indicator)
+    h_variance = np.var(horizontal_projection)
+    v_variance = np.var(vertical_projection)
+    
+    # If vertical variance is much higher, might be rotated
+    if v_variance > h_variance * 1.5 and h < w:
+        logger.debug("Text density suggests rotation needed")
+        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+        h, w = image.shape[:2]
+    
+    # Final check: ensure portrait orientation
+    if h <= w:
+        logger.debug("Final orientation check: rotating to portrait")
+        image = cv2.rotate(image, cv2.ROTATE_90_CLOCKWISE)
+    
+    return image
+
+
+def extract_contours(image: np.ndarray) -> List[np.ndarray]:
+    """
+    Step 4: Extract contours for stacked receipts.
+    
+    Uses aggressive thresholding and morphology to detect receipt boundaries.
+    """
+    # Adaptive threshold
+    thresh = cv2.adaptiveThreshold(
+        image,
+        255,
+        cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+        cv2.THRESH_BINARY_INV,
+        35,
+        10
+    )
+    
+    # Morphology: close with tall kernel for vertically stacked receipts
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (25, 45))
+    morph = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+    
+    # Additional opening to remove noise
+    kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (5, 5))
+    morph = cv2.morphologyEx(morph, cv2.MORPH_OPEN, kernel_small)
+    
+    # Canny edge detection
+    edges = cv2.Canny(morph, 40, 160)
+    
+    # Find contours
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        logger.warning("No contours found after edge detection")
+        return []
+    
+    logger.info(f"Found {len(contours)} total contours from edge detection")
+    
+    # Filter contours by size and aspect ratio
+    h, w = image.shape[:2]
+    valid_contours = []
+    rejected_contours = []
+    
+    logger.info(f"Evaluating {len(contours)} contours for receipt detection (image size: {w}x{h})")
+    
+    # Very relaxed thresholds for faint receipts
+    # Use scoring system: accept if meets at least 1 out of 4 criteria OR has reasonable area
+    min_height_ratio = 0.01   # 1% of image height
+    min_width_ratio = 0.03    # 3% of image width
+    min_aspect_ratio = 0.3    # Very permissive aspect ratio
+    min_area_ratio = 0.001    # 0.1% of image area (very relaxed)
+    
+    for idx, contour in enumerate(contours):
+            x, y, cw, ch = cv2.boundingRect(contour)
+            area = cv2.contourArea(contour)
+            area_ratio = area / (h * w)
+            aspect_ratio = ch / cw if cw > 0 else 0
+            
+            rejection_reasons = []
+            score = 0  # Score based on how many criteria are met
+            
+            # Check each criterion and score
+            if ch > h * min_height_ratio:
+                score += 1
+            else:
+                rejection_reasons.append(f"height too small ({ch}px < {h*min_height_ratio:.0f}px, {ch/h*100:.1f}% < {min_height_ratio*100:.0f}%)")
+            
+            if cw > w * min_width_ratio:
+                score += 1
+            else:
+                rejection_reasons.append(f"width too small ({cw}px < {w*min_width_ratio:.0f}px, {cw/w*100:.1f}% < {min_width_ratio*100:.0f}%)")
+            
+            if aspect_ratio > min_aspect_ratio:
+                score += 1
+            else:
+                rejection_reasons.append(f"aspect ratio too low ({aspect_ratio:.2f} < {min_aspect_ratio:.2f})")
+            
+            if area_ratio > min_area_ratio:
+                score += 1
+            else:
+                rejection_reasons.append(f"area too small ({area_ratio*100:.2f}% < {min_area_ratio*100:.2f}%)")
+            
+            # Reject if area is too large (full page)
+            if area_ratio > 0.95:
+                rejection_reasons.append(f"area too large ({area_ratio*100:.2f}% > 95%)")
+                score = 0
+            
+            # Accept if: score >= 1 OR area_ratio > 0.0005 (very permissive)
+            # This allows small receipts that might fail some criteria
+            # Also accept if it's reasonably sized (height > 50px and width > 50px)
+            is_reasonably_sized = ch > 50 and cw > 50
+            
+            if score >= 1 or area_ratio > 0.0005 or is_reasonably_sized:
+                valid_contours.append(contour)
+                accept_reason = []
+                if score >= 1:
+                    accept_reason.append(f"score={score}/4")
+                if area_ratio > 0.0005:
+                    accept_reason.append(f"area={area_ratio*100:.2f}%")
+                if is_reasonably_sized:
+                    accept_reason.append(f"size={cw}x{ch}px")
+                logger.info(f"Contour {idx + 1} ACCEPTED ({', '.join(accept_reason)}): bbox=({x},{y},{cw},{ch}), area={area_ratio*100:.2f}%, aspect={aspect_ratio:.2f}")
+            else:
+                rejected_contours.append({
+                    "index": idx + 1,
+                    "bbox": (x, y, cw, ch),
+                    "area_ratio": area_ratio,
+                    "aspect_ratio": aspect_ratio,
+                    "score": score,
+                    "reasons": rejection_reasons
+                })
+                logger.warning(f"Contour {idx + 1} REJECTED (score={score}/4): {', '.join(rejection_reasons)} (bbox=({x},{y},{cw},{ch}), area={area_ratio*100:.2f}%, aspect={aspect_ratio:.2f})")
+    
+    logger.info(f"Contour filtering results: {len(valid_contours)} ACCEPTED, {len(rejected_contours)} REJECTED out of {len(contours)} total")
+    
+    # Log summary of rejection reasons
+    if rejected_contours:
+        rejection_summary = {}
+        for r in rejected_contours:
+            for reason in r["reasons"]:
+                reason_type = reason.split(":")[0] if ":" in reason else reason
+                rejection_summary[reason_type] = rejection_summary.get(reason_type, 0) + 1
+        
+        logger.warning(f"Rejection reasons summary: {rejection_summary}")
+        
+        # Log rejected contours with scores
+        logger.warning(f"Rejected contours breakdown:")
+        for r in rejected_contours[:20]:  # Show first 20
+            score_info = f"score={r.get('score', 'N/A')}/4" if 'score' in r else ""
+            logger.warning(f"  Contour {r['index']} ({score_info}): {', '.join(r['reasons'][:2])}")  # Show first 2 reasons
+        if len(rejected_contours) > 20:
+            logger.warning(f"  ... and {len(rejected_contours) - 20} more rejected contours")
+    
+    return valid_contours
+
+
+def slice_receipt_region(region: np.ndarray) -> List[np.ndarray]:
+    """
+    Step 5: Multi-receipt slicing using horizontal projection.
+    
+    Splits stacked receipts by finding valleys in horizontal projection.
+    """
+    h, w = region.shape[:2]
+    
+    # Calculate horizontal projection (sum of pixels along rows)
+    horizontal_proj = cv2.reduce(region, 1, cv2.REDUCE_SUM, dtype=cv2.CV_32F)
+    horizontal_proj = horizontal_proj.flatten()
+    
+    # Normalize projection
+    if horizontal_proj.max() > 0:
+        horizontal_proj = horizontal_proj / horizontal_proj.max()
+    
+    # Find valleys (gaps between receipts)
+    # Use threshold to identify text regions vs gaps
+    # Lower threshold (0.2 instead of 0.3) to catch faint receipts
+    threshold = np.mean(horizontal_proj) * 0.2  # 20% of mean as threshold
+    
+    # Find continuous regions above threshold
+    above_threshold = horizontal_proj > threshold
+    
+    # Find split points (transitions from text to gap)
+    splits = []
+    in_text = False
+    text_start = 0
+    
+    for i, is_text in enumerate(above_threshold):
+        if is_text and not in_text:
+            # Entering text region
+            if text_start > 0:
+                # Save split point (middle of gap)
+                splits.append((text_start + i) // 2)
+            text_start = i
+            in_text = True
+        elif not is_text and in_text:
+            # Exiting text region
+            in_text = False
+    
+    # If no clear splits found, try alternative method
+    if len(splits) == 0:
+        # Use simple gradient-based approach (no scipy dependency)
+        # Find local minima by checking for valleys
+        splits = []
+        for i in range(1, len(horizontal_proj) - 1):
+            # Check if current point is a valley (lower than neighbors)
+            if (horizontal_proj[i] < threshold and 
+                horizontal_proj[i] < horizontal_proj[i-1] and
+                horizontal_proj[i] < horizontal_proj[i+1]):
+                splits.append(i)
+        
+        # Remove splits that are too close together
+        if len(splits) > 1:
+            min_distance = h // 10
+            filtered_splits = [splits[0]]
+            for s in splits[1:]:
+                if s - filtered_splits[-1] >= min_distance:
+                    filtered_splits.append(s)
+            splits = filtered_splits
+    
+    # Remove splits too close to edges
+    splits = [s for s in splits if s > h * 0.05 and s < h * 0.95]
+    
+    # Create slices
+    slices = []
+    start = 0
+    
+    for split in sorted(splits):
+        if split - start > h * 0.10:  # Minimum slice height
+            slice_img = region[start:split, :]
+            if slice_img.size > 0:
+                slices.append(slice_img)
+            start = split
+    
+    # Add final slice
+    if h - start > h * 0.10:
+        slice_img = region[start:, :]
+        if slice_img.size > 0:
+            slices.append(slice_img)
+    
+    # If no splits found, return original region as single slice
+    if len(slices) == 0:
+        logger.debug("No splits found, returning original region")
+        return [region]
+    
+    logger.info(f"Split region into {len(slices)} slices")
+    return slices
+
+
+def sort_contours_by_position(contours: List[np.ndarray], image_shape: Tuple[int, int]) -> List[np.ndarray]:
+    """
+    Sort contours by Y-coordinate (top to bottom) for consistent processing order.
+    """
+    # Get bounding boxes
+    bounding_boxes = [(cv2.boundingRect(c), c) for c in contours]
+    
+    # Sort by Y-coordinate (top to bottom)
+    sorted_boxes = sorted(bounding_boxes, key=lambda x: x[0][1])
+    
+    return [contour for _, contour in sorted_boxes]
+
+
+def save_crop(crop_img: np.ndarray, output_dir: Path, base_name: str) -> str:
+    """
+    Save cropped receipt image to disk.
+    
+    Args:
+        crop_img: Cropped image array
+        output_dir: Directory to save crop
+        base_name: Base name for the file
+        
+    Returns:
+        Path to saved crop as string
+    """
+    # Generate unique filename
+    unique_id = str(uuid.uuid4())[:8]
+    filename = f"{base_name}_{unique_id}.png"
+    crop_path = output_dir / filename
+    
+    # Save image
+    cv2.imwrite(str(crop_path), crop_img)
+    
+    return str(crop_path)
 
 
 def order_points(pts):

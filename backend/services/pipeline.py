@@ -20,16 +20,74 @@ from models.receipt import ReceiptCreate
 logger = logging.getLogger(__name__)
 
 
+def calculate_confidence_score(extracted_fields: Dict[str, Any], llm_success: bool, ocr_text: str) -> float:
+    """
+    Calculate confidence score based on extraction quality.
+    
+    Factors:
+    - LLM extraction success (40%)
+    - Number of fields extracted (40%)
+    - OCR text quality (20%)
+    
+    Returns: float between 0.0 and 1.0
+    """
+    score = 0.0
+    
+    # Factor 1: LLM extraction success (40%)
+    if llm_success:
+        score += 0.4
+    # If LLM failed, we get 0 for this factor
+    
+    # Factor 2: Number of fields extracted (40%)
+    # Key fields: merchant_name, date, total_amount, tax_amount, currency
+    key_fields = ["merchant_name", "date", "total_amount", "tax_amount", "currency"]
+    extracted_count = sum(1 for field in key_fields if extracted_fields.get(field) is not None)
+    field_score = (extracted_count / len(key_fields)) * 0.4
+    score += field_score
+    
+    # Factor 3: OCR text quality (20%)
+    # Based on text length and character diversity
+    if ocr_text and len(ocr_text.strip()) > 0:
+        text_length = len(ocr_text.strip())
+        # Good OCR should have at least 50 characters
+        if text_length >= 50:
+            # Check for character diversity (not just repeated characters)
+            unique_chars = len(set(ocr_text.strip().lower()))
+            if unique_chars >= 10:  # At least 10 different characters
+                score += 0.2
+            elif unique_chars >= 5:
+                score += 0.1
+        elif text_length >= 20:
+            score += 0.1
+    
+    # Ensure score is between 0.0 and 1.0
+    return max(0.0, min(1.0, score))
+
+
+def is_image_file(file_path: Path) -> bool:
+    """Check if file is an image based on extension."""
+    image_extensions = [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"]
+    return any(str(file_path).lower().endswith(ext) for ext in image_extensions)
+
+
+def is_pdf_file(file_path: Path) -> bool:
+    """Check if file is a PDF based on extension."""
+    return str(file_path).lower().endswith(".pdf")
+
+
 def process_pdf_pipeline(
     file_id: str,
     db: Session,
     progress_callback=None
 ) -> List[Dict[str, Any]]:
     """
-    Complete pipeline: PDF → Images → YOLO → OCR → LLM → Database.
+    Complete pipeline: PDF/Image → Images → Detection → OCR → LLM → Database.
+    
+    Supports both PDF files and image files (PNG, JPG, JPEG, BMP, TIFF, WEBP).
+    If image is uploaded, skips PDF conversion step.
     
     Args:
-        file_id: ID of the uploaded PDF file
+        file_id: ID of the uploaded file (PDF or image)
         db: Database session
         progress_callback: Optional callback function(progress: int, message: str)
         
@@ -41,9 +99,9 @@ def process_pdf_pipeline(
     if not uploaded_file:
         raise ValueError(f"File not found: {file_id}")
     
-    pdf_path = Path(uploaded_file.file_path)
-    if not pdf_path.exists():
-        raise FileNotFoundError(f"PDF file not found: {pdf_path}")
+    file_path = Path(uploaded_file.file_path)
+    if not file_path.exists():
+        raise FileNotFoundError(f"File not found: {file_path}")
     
     # Check Ollama connection
     if not check_ollama_connection():
@@ -57,21 +115,43 @@ def process_pdf_pipeline(
     pipeline_start_time = time.time()
     
     try:
-        # Step 1: Convert PDF to images
-        if progress_callback:
-            progress_callback(10, "Converting PDF to images...")
-        
-        logger.info(f"Converting PDF to images: {pdf_path}")
-        step_start = time.time()
-        
-        images_dir = settings.TEMP_DIR / f"{file_id}_images"
-        images_dir.mkdir(exist_ok=True)
-        image_paths = pdf_to_images(pdf_path, images_dir)
-        
-        logger.info(f"Extracted {len(image_paths)} images in {time.time() - step_start:.2f}s")
-        
-        if not image_paths:
-            raise ValueError("No images extracted from PDF")
+        # Step 1: Convert PDF to images OR use image directly
+        if is_image_file(file_path):
+            # Image file: use directly, skip PDF conversion
+            if progress_callback:
+                progress_callback(10, "Processing image file...")
+            
+            logger.info(f"Processing image file directly: {file_path}")
+            image_paths = [file_path]
+            
+            # If needed, copy to temp directory for consistency
+            images_dir = settings.TEMP_DIR / f"{file_id}_images"
+            images_dir.mkdir(exist_ok=True)
+            temp_image_path = images_dir / f"{file_id}_page_1{file_path.suffix}"
+            if not temp_image_path.exists():
+                import shutil
+                shutil.copy2(file_path, temp_image_path)
+                image_paths = [temp_image_path]
+                logger.debug(f"Copied image to temp directory: {temp_image_path}")
+            
+        elif is_pdf_file(file_path):
+            # PDF file: convert to images
+            if progress_callback:
+                progress_callback(10, "Converting PDF to images...")
+            
+            logger.info(f"Converting PDF to images: {file_path}")
+            step_start = time.time()
+            
+            images_dir = settings.TEMP_DIR / f"{file_id}_images"
+            images_dir.mkdir(exist_ok=True)
+            image_paths = pdf_to_images(file_path, images_dir)
+            
+            logger.info(f"Extracted {len(image_paths)} images in {time.time() - step_start:.2f}s")
+            
+            if not image_paths:
+                raise ValueError("No images extracted from PDF")
+        else:
+            raise ValueError(f"Unsupported file type: {file_path.suffix}. Supported: PDF, PNG, JPG, JPEG, BMP, TIFF, WEBP")
         
         all_receipts = []
         total_steps = len(image_paths)
@@ -186,9 +266,11 @@ def process_pdf_pipeline(
                         progress_callback(receipt_progress, f"Extracting data from receipt {receipt_number} ({total_receipts_processed}/{estimated_total_receipts})...")
                     
                     llm_start = time.time()
+                    llm_success = False
                     try:
                         extracted_fields = extract_fields_llm(ocr_text)
                         llm_duration = time.time() - llm_start
+                        llm_success = True
                         logger.info(f"[OK] LLM extraction completed in {llm_duration:.2f}s")
                         if llm_duration > 60:
                             logger.warning(f"[WARNING] LLM extraction took {llm_duration:.2f}s (slow)")
@@ -207,16 +289,22 @@ def process_pdf_pipeline(
                             "payment_method": None,
                             "address": None,
                             "phone": None,
+                            "currency": None,
+                            "vat_amount": None,
+                            "vat_percentage": None,
                         }
                         logger.warning("[WARNING] Continuing with empty extracted fields due to LLM failure")
                         # Note: We still count this as successful (receipt was processed, just with empty fields)
+                    
+                    # Calculate confidence score based on extraction quality
+                    confidence_score = calculate_confidence_score(extracted_fields, llm_success, ocr_text)
+                    logger.debug(f"    Calculated confidence score: {confidence_score:.2%} (LLM success: {llm_success}, fields extracted: {sum(1 for k in ['merchant_name', 'date', 'total_amount', 'tax_amount', 'currency'] if extracted_fields.get(k) is not None)}/5)")
                     
                     # Step 5: Save to database
                     
                     # Convert items to JSON string for storage
                     items_json = None
                     if extracted_fields.get("items"):
-                        import json
                         items_json = json.dumps(extracted_fields["items"])
                     
                     receipt_data = ReceiptCreate(
@@ -233,7 +321,7 @@ def process_pdf_pipeline(
                         phone=extracted_fields.get("phone"),
                         raw_text=ocr_text,
                         image_path=str(cropped_path),
-                        confidence_score=1.0  # Classical CV doesn't provide confidence, use 1.0
+                        confidence_score=confidence_score
                     )
                     
                     # Create database record
@@ -251,7 +339,7 @@ def process_pdf_pipeline(
                         phone=receipt_data.phone,
                         raw_text=receipt_data.raw_text,
                         image_path=receipt_data.image_path,
-                        confidence_score=1.0  # Classical CV doesn't provide confidence, use 1.0
+                        confidence_score=receipt_data.confidence_score
                     )
                     
                     db.add(db_receipt)
