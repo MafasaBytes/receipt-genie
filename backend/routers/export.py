@@ -44,16 +44,67 @@ async def export_csv(
     # Prepare data for DataFrame
     data = []
     for receipt in receipts:
-        items = json.loads(receipt.items) if receipt.items else []
-        items_str = "; ".join([f"{item.get('name', '')} (${item.get('total', 0)})" for item in items])
-        
+        # Items + metadata are stored as JSON in the items column
+        items_raw = json.loads(receipt.items) if receipt.items else {}
+        if isinstance(items_raw, dict):
+            items_list = items_raw.get("items", [])
+            metadata = items_raw.get("_metadata", {})
+        else:
+            items_list = items_raw if isinstance(items_raw, list) else []
+            metadata = {}
+
+        # Human‑readable items string
+        def format_item(item: dict) -> str:
+            name = item.get("name", "") or ""
+            # Prefer line_total, fall back to total
+            total = item.get("line_total", item.get("total", 0.0)) or 0.0
+            return f"{name} ({total})" if name else str(total)
+
+        items_str = "; ".join([format_item(item) for item in items_list])
+
+        # VAT % – prefer effective percentage when available
+        vat_percentage = receipt.vat_percentage_effective
+        if vat_percentage is None:
+            vat_percentage = metadata.get("vat_percentage")
+
+        # Currency from metadata if present
+        currency = metadata.get("currency")
+
+        # Optional VAT breakdown string for richer exports
+        vat_breakdown_str = ""
+        if receipt.vat_breakdown:
+            try:
+                breakdown = receipt.vat_breakdown
+                vat_parts = []
+                for entry in breakdown:
+                    rate = entry.get("vat_rate")
+                    base = entry.get("base_amount")
+                    tax = entry.get("tax_amount")
+                    if rate is not None:
+                        part = f"{rate}%"
+                        details = []
+                        if base is not None:
+                            details.append(f"base={base}")
+                        if tax is not None:
+                            details.append(f"tax={tax}")
+                        if details:
+                            part += f" ({', '.join(details)})"
+                        vat_parts.append(part)
+                vat_breakdown_str = "; ".join(vat_parts)
+            except Exception:
+                # Fallback: raw JSON string if something goes wrong
+                vat_breakdown_str = json.dumps(receipt.vat_breakdown)
+
         data.append({
             "Receipt Number": receipt.receipt_number,
-            "Merchant Name": receipt.merchant_name or "",
+            "Store Name": receipt.merchant_name or "",
             "Date": receipt.date or "",
             "Subtotal": receipt.subtotal or 0.0,
-            "Tax Amount": receipt.tax_amount or 0.0,
+            "VAT Amount": receipt.tax_amount or 0.0,
+            "VAT %": vat_percentage or 0.0,
+            "VAT Breakdown": vat_breakdown_str,
             "Total Amount": receipt.total_amount or 0.0,
+            "Currency": currency or "",
             "Payment Method": receipt.payment_method or "",
             "Items": items_str,
             "Address": receipt.address or "",
@@ -102,19 +153,63 @@ async def export_excel(
     if not receipts:
         raise HTTPException(status_code=404, detail="No receipts found for this file")
     
-    # Prepare data for DataFrame
+    # Prepare data for DataFrame (same structure as CSV export)
     data = []
     for receipt in receipts:
-        items = json.loads(receipt.items) if receipt.items else []
-        items_str = "; ".join([f"{item.get('name', '')} (${item.get('total', 0)})" for item in items])
-        
+        items_raw = json.loads(receipt.items) if receipt.items else {}
+        if isinstance(items_raw, dict):
+            items_list = items_raw.get("items", [])
+            metadata = items_raw.get("_metadata", {})
+        else:
+            items_list = items_raw if isinstance(items_raw, list) else []
+            metadata = {}
+
+        def format_item(item: dict) -> str:
+            name = item.get("name", "") or ""
+            total = item.get("line_total", item.get("total", 0.0)) or 0.0
+            return f"{name} ({total})" if name else str(total)
+
+        items_str = "; ".join([format_item(item) for item in items_list])
+
+        vat_percentage = receipt.vat_percentage_effective
+        if vat_percentage is None:
+            vat_percentage = metadata.get("vat_percentage")
+
+        currency = metadata.get("currency")
+
+        vat_breakdown_str = ""
+        if receipt.vat_breakdown:
+            try:
+                breakdown = receipt.vat_breakdown
+                vat_parts = []
+                for entry in breakdown:
+                    rate = entry.get("vat_rate")
+                    base = entry.get("base_amount")
+                    tax = entry.get("tax_amount")
+                    if rate is not None:
+                        part = f"{rate}%"
+                        details = []
+                        if base is not None:
+                            details.append(f"base={base}")
+                        if tax is not None:
+                            details.append(f"tax={tax}")
+                        if details:
+                            part += f" ({', '.join(details)})"
+                        vat_parts.append(part)
+                vat_breakdown_str = "; ".join(vat_parts)
+            except Exception:
+                vat_breakdown_str = json.dumps(receipt.vat_breakdown)
+
         data.append({
             "Receipt Number": receipt.receipt_number,
-            "Merchant Name": receipt.merchant_name or "",
+            "Store Name": receipt.merchant_name or "",
             "Date": receipt.date or "",
             "Subtotal": receipt.subtotal or 0.0,
-            "Tax Amount": receipt.tax_amount or 0.0,
+            "VAT Amount": receipt.tax_amount or 0.0,
+            "VAT %": vat_percentage or 0.0,
+            "VAT Breakdown": vat_breakdown_str,
             "Total Amount": receipt.total_amount or 0.0,
+            "Currency": currency or "",
             "Payment Method": receipt.payment_method or "",
             "Items": items_str,
             "Address": receipt.address or "",

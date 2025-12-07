@@ -27,7 +27,7 @@ CRITICAL RULES:
 - Output ONLY valid JSON. No explanations. No markdown.
 - Use null for missing values.
 - Numbers must be floats (e.g., 9.72).
-- VAT should always be expressed as a percentage (e.g., 21.0, 9.0).
+- VAT should always be expressed as a percentage (e.g., 21.0, 9.0, 10.0).
 - If multiple VAT rates appear, list them ALL in vat_breakdown.
 
 JSON SCHEMA TO RETURN:
@@ -382,7 +382,7 @@ def reconcile_vat_and_items(extracted: Dict[str, Any], ocr_text: str = "") -> Di
             rate = entry["vat_rate"]
             tax = entry["tax_amount"]
             # Calculate base from tax: base = tax / (rate / 100)
-            if rate > 0:
+            if rate and rate > 0:
                 base = tax / (rate / 100)
                 entry["base_amount"] = round(base, 2)
     
@@ -391,8 +391,93 @@ def reconcile_vat_and_items(extracted: Dict[str, Any], ocr_text: str = "") -> Di
         if entry.get("tax_amount") is None and entry.get("base_amount") is not None and entry.get("vat_rate") is not None:
             rate = entry["vat_rate"]
             base = entry["base_amount"]
-            tax = base * (rate / 100)
+            if rate and rate > 0:
+                tax = base * (rate / 100)
+                entry["tax_amount"] = round(tax, 2)
+
+    # --- VAT sanity checks & normalization ---
+    # Common Dutch/EU VAT rates (tight mapping, focused on NL use-case)
+    # - 0%  : zero / exempt
+    # - 9%  : low rate
+    # - 10% : some special cases / canteens
+    # - 21% : standard rate
+    common_vat_rates = [0.0, 9.0, 10.0, 21.0]
+
+    total_amount = validated.get("total_amount")
+
+    for entry in vat_breakdown:
+        rate = entry.get("vat_rate")
+        base = entry.get("base_amount")
+        tax = entry.get("tax_amount")
+
+        # Skip entries without a rate
+        if rate is None:
+            continue
+
+        # Snap rate to nearest common VAT rate if it's very close (tolerance 0.3%)
+        nearest_rate = min(common_vat_rates, key=lambda r: abs(r - rate))
+        if abs(nearest_rate - rate) <= 0.3:
+            rate = nearest_rate
+            entry["vat_rate"] = rate
+
+        # Basic bounds check – anything above 30% is highly suspicious for NL/EU
+        if rate < 0 or rate > 30:
+            warnings.append(f"vat_rate_out_of_range:{rate}")
+            entry["vat_rate"] = None
+            continue
+
+        # If tax looks more like a base amount (too large vs total), treat it as base
+        if tax is not None and total_amount is not None:
+            try:
+                if tax > float(total_amount) * 0.5:
+                    # Likely base amount misclassified as tax
+                    base = tax
+                    tax = None
+                    entry["base_amount"] = round(base, 2)
+                    entry["tax_amount"] = None
+                    warnings.append("vat_tax_amount_reinterpreted_as_base")
+            except Exception:
+                pass
+
+        # Make base/tax consistent with the VAT rate
+        base = entry.get("base_amount")
+        tax = entry.get("tax_amount")
+
+        if rate and rate > 0:
+            if base is not None and tax is not None:
+                # Validate: tax should be base * rate / 100 within a small tolerance
+                expected_tax = round(base * (rate / 100), 2)
+                if abs(expected_tax - tax) > 0.03:
+                    entry["tax_amount"] = expected_tax
+                    warnings.append("vat_tax_corrected_from_math")
+            elif tax is not None:
+                # Derive base from tax
+                base = tax / (rate / 100)
+                entry["base_amount"] = round(base, 2)
+            elif base is not None:
+                # Derive tax from base
+                tax = base * (rate / 100)
+                entry["tax_amount"] = round(tax, 2)
+
+    # After fixing individual entries, ensure aggregate tax aligns with totals where possible
+    total_base_from_bd = sum(e.get("base_amount", 0) or 0 for e in vat_breakdown)
+    total_tax_from_bd = sum(e.get("tax_amount", 0) or 0 for e in vat_breakdown)
+
+    # If we have exactly one VAT rate and a reliable total, force math to be consistent
+    if len(vat_breakdown) == 1 and total_amount is not None:
+        entry = vat_breakdown[0]
+        rate = entry.get("vat_rate")
+        if rate and rate > 0:
+            # Assume tax‑included total: total = base + tax
+            base = float(total_amount) / (1 + rate / 100)
+            tax = float(total_amount) - base
+            entry["base_amount"] = round(base, 2)
             entry["tax_amount"] = round(tax, 2)
+            total_base_from_bd = entry["base_amount"]
+            total_tax_from_bd = entry["tax_amount"]
+            validated["subtotal"] = entry["base_amount"]
+            validated["tax_amount"] = entry["tax_amount"]
+            warnings.append("vat_single_rate_totals_normalized")
     
     validated["vat_breakdown"] = vat_breakdown
     
@@ -403,14 +488,26 @@ def reconcile_vat_and_items(extracted: Dict[str, Any], ocr_text: str = "") -> Di
         total_tax = sum(e.get("tax_amount", 0) or 0 for e in vat_breakdown)
         
         if total_base > 0:
-            vat_percentage_effective = round((total_tax / total_base) * 100, 1)
+            vat_percentage_effective = (total_tax / total_base) * 100
         elif total_tax > 0 and validated.get("total_amount"):
             # Fallback: use total_amount
             total = float(validated["total_amount"])
             if total > total_tax:
                 base = total - total_tax
                 if base > 0:
-                    vat_percentage_effective = round((total_tax / base) * 100, 1)
+                    vat_percentage_effective = (total_tax / base) * 100
+
+    # Snap effective VAT to nearest common rate when close, and clamp to realistic range
+    if vat_percentage_effective is not None:
+        nearest_rate = min(common_vat_rates, key=lambda r: abs(r - vat_percentage_effective))
+        if abs(nearest_rate - vat_percentage_effective) <= 0.3:
+            vat_percentage_effective = nearest_rate
+        # Reject clearly invalid rates (>30%) by nulling and warning
+        if vat_percentage_effective < 0 or vat_percentage_effective > 30:
+            warnings.append(f"vat_percentage_effective_out_of_range:{vat_percentage_effective}")
+            vat_percentage_effective = None
+        else:
+            vat_percentage_effective = round(vat_percentage_effective, 1)
     
     validated["vat_percentage_effective"] = vat_percentage_effective
     
