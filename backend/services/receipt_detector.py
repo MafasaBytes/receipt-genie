@@ -99,8 +99,10 @@ def detect_receipts(image_path: Path) -> List[str]:
                     rejected_regions.append({"contour": idx + 1, "reason": reason, "area_ratio": area_ratio})
                     continue
                 
-                if area_ratio > 0.95:
-                    reason = f"area ratio too large ({area_ratio*100:.2f}% > 95%)"
+                # Allow larger receipts (up to 98%) to handle single large receipt per page scenarios
+                # Only reject if it's truly covering the entire page (likely a detection error)
+                if area_ratio > 0.98:
+                    reason = f"area ratio too large ({area_ratio*100:.2f}% > 98%)"
                     logger.warning(f"  REJECTED: {reason}")
                     rejected_regions.append({"contour": idx + 1, "reason": reason, "area_ratio": area_ratio})
                     continue
@@ -114,27 +116,34 @@ def detect_receipts(image_path: Path) -> List[str]:
                     rejected_regions.append({"contour": idx + 1, "reason": reason})
                     continue
                 
-                # Check if region needs slicing (covers > 70% of page height - relaxed from 80%)
-                if h > oriented.shape[0] * 0.70:
-                    logger.info(f"  Large region detected ({h}px height, {h/oriented.shape[0]*100:.1f}% of page), attempting slicing...")
+                # Check if region needs slicing (covers > 75% of page height)
+                # Only attempt slicing if region is very tall AND we detect multiple receipts
+                # For single large receipts per page, treat as single receipt even if tall
+                height_ratio = h / oriented.shape[0]
+                if height_ratio > 0.75 and area_ratio < 0.85:
+                    # Region is tall but not covering most of the page - likely stacked receipts
+                    logger.info(f"  Large region detected ({h}px height, {height_ratio*100:.1f}% of page, {area_ratio*100:.1f}% area), attempting slicing...")
                     slices = slice_receipt_region(region)
                     
-                    if len(slices) == 0:
-                        reason = "slicing produced no valid slices"
-                        logger.warning(f"  REJECTED: {reason}")
-                        rejected_regions.append({"contour": idx + 1, "reason": reason})
-                        continue
-                    
-                    logger.info(f"  Sliced into {len(slices)} receipt(s)")
-                    for slice_idx, slice_img in enumerate(slices):
-                        if slice_img.size > 0:
-                            crop_path = save_crop(slice_img, crops_dir, f"{image_path.stem}_region_{idx}_slice_{slice_idx}")
-                            cropped_paths.append(crop_path)
-                            logger.info(f"  ✓ Saved slice {slice_idx + 1}/{len(slices)}: {Path(crop_path).name}")
-                        else:
-                            logger.warning(f"  REJECTED slice {slice_idx + 1}: empty slice")
+                    # Only use slices if we found multiple clear splits
+                    # If slicing returns only 1 slice, treat as single receipt
+                    if len(slices) > 1:
+                        logger.info(f"  Sliced into {len(slices)} receipt(s)")
+                        for slice_idx, slice_img in enumerate(slices):
+                            if slice_img.size > 0:
+                                crop_path = save_crop(slice_img, crops_dir, f"{image_path.stem}_region_{idx}_slice_{slice_idx}")
+                                cropped_paths.append(crop_path)
+                                logger.info(f"  ✓ Saved slice {slice_idx + 1}/{len(slices)}: {Path(crop_path).name}")
+                            else:
+                                logger.warning(f"  REJECTED slice {slice_idx + 1}: empty slice")
+                    else:
+                        # Slicing didn't find multiple receipts, treat as single receipt
+                        logger.info(f"  Slicing found only 1 region, treating as single receipt")
+                        crop_path = save_crop(region, crops_dir, f"{image_path.stem}_region_{idx}")
+                        cropped_paths.append(crop_path)
+                        logger.info(f"  ✓ Saved receipt: {Path(crop_path).name}")
                 else:
-                    # Single receipt in this region
+                    # Single receipt in this region (either not tall enough or covers most of page)
                     crop_path = save_crop(region, crops_dir, f"{image_path.stem}_region_{idx}")
                     cropped_paths.append(crop_path)
                     logger.info(f"  ✓ Saved receipt: {Path(crop_path).name}")
@@ -389,9 +398,9 @@ def extract_contours(image: np.ndarray) -> List[np.ndarray]:
             else:
                 rejection_reasons.append(f"area too small ({area_ratio*100:.2f}% < {min_area_ratio*100:.2f}%)")
             
-            # Reject if area is too large (full page)
-            if area_ratio > 0.95:
-                rejection_reasons.append(f"area too large ({area_ratio*100:.2f}% > 95%)")
+            # Reject if area is too large (full page) - but allow up to 98% for single large receipts
+            if area_ratio > 0.98:
+                rejection_reasons.append(f"area too large ({area_ratio*100:.2f}% > 98%)")
                 score = 0
             
             # Accept if: score >= 1 OR area_ratio > 0.0005 (very permissive)
