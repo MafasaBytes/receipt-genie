@@ -62,41 +62,49 @@ def run_ocr(image_path: Path) -> str:
     ocr_engine = initialize_ocr_engine()
     if ocr_engine is not None:
         try:
-            logger.debug(f"Running PaddleOCR on: {image_path}")
+            logger.info(f"Running PaddleOCR on: {image_path}")
             # Note: cls parameter not supported in this version
             result = ocr_engine.ocr(str(image_path))
             
-            if result and len(result) > 0 and result[0]:
-                # PaddleOCR 3.x returns OCRResult objects (dict-like)
-                ocr_result = result[0]
+            # Debug: Log the raw result structure
+            logger.info(f"PaddleOCR raw result type: {type(result)}")
+            if result:
+                logger.info(f"PaddleOCR result length: {len(result)}")
+                if len(result) > 0:
+                    logger.info(f"PaddleOCR result[0] type: {type(result[0])}")
+                    if isinstance(result[0], dict):
+                        logger.info(f"PaddleOCR result[0] keys: {list(result[0].keys())[:10]}")
+                    logger.info(f"PaddleOCR result[0] content preview: {str(result[0])[:500]}")
+            
+            # Debug: Log the raw result structure
+            logger.debug(f"PaddleOCR raw result type: {type(result)}")
+            if result:
+                logger.debug(f"PaddleOCR result length: {len(result)}")
+                if len(result) > 0:
+                    logger.debug(f"PaddleOCR result[0] type: {type(result[0])}")
+                    logger.debug(f"PaddleOCR result[0] content (first 500 chars): {str(result[0])[:500]}")
+            
+            if result and len(result) > 0:
+                # PaddleOCR can return different formats depending on version
+                # Handle both new format (OCRResult dict) and old format (list of tuples)
                 
-                # Try multiple methods to extract text
                 extracted_text = None
                 
-                # Method 1: Extract from rec_texts field (preferred)
-                rec_texts = ocr_result.get('rec_texts', [])
-                if rec_texts and isinstance(rec_texts, list):
-                    extracted_text = '\n'.join(str(text) for text in rec_texts if text)
-                    logger.debug(f"PaddleOCR extracted {len(rec_texts)} text segments from rec_texts, {len(extracted_text)} characters")
+                # Check if result[0] is a dict (new format) or list (old format)
+                first_result = result[0]
                 
-                # Method 2: Try to extract from dt_polys or other fields if rec_texts is missing
-                if not extracted_text or not extracted_text.strip():
-                    # Check if result has a different structure (older PaddleOCR versions)
-                    if isinstance(ocr_result, (list, tuple)):
-                        # Old format: list of [bbox, (text, confidence)]
-                        text_lines = []
-                        for item in ocr_result:
-                            if isinstance(item, (list, tuple)) and len(item) >= 2:
-                                text_info = item[1]
-                                if isinstance(text_info, (list, tuple)) and len(text_info) > 0:
-                                    text_lines.append(str(text_info[0]))
-                        if text_lines:
-                            extracted_text = '\n'.join(text_lines)
-                            logger.debug(f"PaddleOCR extracted {len(text_lines)} text lines from old format")
+                if isinstance(first_result, dict):
+                    # New format: OCRResult object (dict-like)
+                    ocr_result = first_result
                     
-                    # Method 3: Try to get text from any text-related fields
+                    # Method 1: Extract from rec_texts field (preferred for new format)
+                    rec_texts = ocr_result.get('rec_texts', [])
+                    if rec_texts and isinstance(rec_texts, list):
+                        extracted_text = '\n'.join(str(text) for text in rec_texts if text)
+                        logger.debug(f"PaddleOCR extracted {len(rec_texts)} text segments from rec_texts, {len(extracted_text)} characters")
+                    
+                    # Method 2: Try other text fields
                     if not extracted_text or not extracted_text.strip():
-                        # Check for other possible text fields
                         for key in ['text', 'ocr_text', 'detected_text', 'lines']:
                             if key in ocr_result:
                                 value = ocr_result[key]
@@ -108,12 +116,52 @@ def run_ocr(image_path: Path) -> str:
                                     logger.debug(f"PaddleOCR extracted text from {key} field")
                                     break
                 
+                elif isinstance(first_result, (list, tuple)):
+                    # Old format: list of [bbox, (text, confidence)] tuples
+                    text_lines = []
+                    for item in first_result:
+                        if isinstance(item, (list, tuple)) and len(item) >= 2:
+                            # item[0] is bbox, item[1] is (text, confidence)
+                            text_info = item[1]
+                            if isinstance(text_info, (list, tuple)) and len(text_info) > 0:
+                                text_lines.append(str(text_info[0]))
+                            elif isinstance(text_info, str):
+                                text_lines.append(text_info)
+                    if text_lines:
+                        extracted_text = '\n'.join(text_lines)
+                        logger.debug(f"PaddleOCR extracted {len(text_lines)} text lines from old format")
+                
+                # Also check if result itself is a list of lists (nested structure)
+                if not extracted_text or not extracted_text.strip():
+                    text_lines = []
+                    for page_result in result:
+                        if isinstance(page_result, list):
+                            for item in page_result:
+                                if isinstance(item, (list, tuple)) and len(item) >= 2:
+                                    text_info = item[1]
+                                    if isinstance(text_info, (list, tuple)) and len(text_info) > 0:
+                                        text_lines.append(str(text_info[0]))
+                                    elif isinstance(text_info, str):
+                                        text_lines.append(text_info)
+                    if text_lines:
+                        extracted_text = '\n'.join(text_lines)
+                        logger.debug(f"PaddleOCR extracted {len(text_lines)} text lines from nested format")
+                
                 if extracted_text and extracted_text.strip():
+                    logger.info(f"PaddleOCR successfully extracted {len(extracted_text)} characters")
                     return extracted_text.strip()
                 else:
                     logger.warning("PaddleOCR returned empty or no text")
+                    # Additional debugging: try to inspect result structure
+                    if result and len(result) > 0:
+                        logger.debug(f"Result structure details: {type(result[0])}, keys: {result[0].keys() if isinstance(result[0], dict) else 'N/A'}")
+                        logger.debug(f"Full result (first 1000 chars): {str(result)[:1000]}")
             else:
                 logger.warning("PaddleOCR returned no results")
+                if result is None:
+                    logger.debug("PaddleOCR result is None")
+                elif len(result) == 0:
+                    logger.debug("PaddleOCR result is empty list")
                 
         except Exception as e:
             logger.error(f"PaddleOCR error: {str(e)}")
@@ -147,12 +195,16 @@ def run_ocr(image_path: Path) -> str:
     
     # Final fallback: return placeholder with image info
     logger.warning(f"Using placeholder OCR text for: {image_path.name}")
+    logger.warning("PaddleOCR found no text in image. This may indicate:")
+    logger.warning("  - Image is too small or low quality")
+    logger.warning("  - Image contains no readable text")
+    logger.warning("  - Image needs preprocessing (contrast, brightness)")
     placeholder = f"""
     RECEIPT TEXT NOT EXTRACTED
     Image: {image_path.name}
-    Note: Install PaddleOCR or pytesseract for real OCR
-    Install: pip install paddlepaddle paddleocr
-    Or: pip install pytesseract
+    PaddleOCR detected no text in this image.
+    This may be due to image quality, size, or lack of readable text.
+    Note: Tesseract OCR binary is not installed (pytesseract package is installed but needs Tesseract executable).
     """
     return placeholder.strip()
 

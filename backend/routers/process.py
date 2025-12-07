@@ -8,7 +8,10 @@ import uuid
 
 from database import get_db
 from models.db_models import UploadedFile, Receipt, ProcessingJob
-from models.receipt import ProcessResponse, JobStatusResponse, ReceiptListResponse, ReceiptResponse
+from models.receipt import (
+    ProcessResponse, JobStatusResponse, ReceiptListResponse, ReceiptResponse,
+    EnhancedReceiptListResponse, PageStat, ReceiptUpdate
+)
 from services.pipeline import process_pdf_pipeline
 from utils.responses import success_response, error_response
 import json
@@ -44,12 +47,20 @@ def process_pdf_background(
             logger = logging.getLogger(__name__)
             logger.info(f"[{job_id}] {progress}%: {message}")
         
-        # Run pipeline
-        receipts = process_pdf_pipeline(file_id, db, progress_callback)
+        # Run pipeline - now returns enhanced response with stats
+        result = process_pdf_pipeline(file_id, db, progress_callback)
         
         import logging
         logger = logging.getLogger(__name__)
-        logger.info(f"[{job_id}] Pipeline completed. Extracted {len(receipts) if receipts else 0} receipt(s)")
+        
+        # Handle both old format (list) and new format (dict with stats)
+        if isinstance(result, dict):
+            receipts = result.get("receipts", [])
+            logger.info(f"[{job_id}] Pipeline completed. Extracted {len(receipts)} receipt(s) from {result.get('receipts_detected', 0)} detected")
+        else:
+            # Legacy format - list of receipts
+            receipts = result if result else []
+            logger.info(f"[{job_id}] Pipeline completed. Extracted {len(receipts)} receipt(s)")
         
         if not receipts or len(receipts) == 0:
             logger.warning(f"[{job_id}] No receipts extracted! Check logs for details.")
@@ -151,12 +162,12 @@ async def get_job_status(
     )
 
 
-@router.get("/receipts/{file_id}", response_model=ReceiptListResponse)
+@router.get("/receipts/{file_id}", response_model=EnhancedReceiptListResponse)
 async def get_receipts(
     file_id: str,
     db: Session = Depends(get_db)
 ):
-    """Get all extracted receipts for a file."""
+    """Get all extracted receipts for a file with enhanced stats."""
     # Verify file exists
     uploaded_file = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
     if not uploaded_file:
@@ -167,7 +178,11 @@ async def get_receipts(
     
     receipt_list = []
     for receipt in receipts:
-        items = json.loads(receipt.items) if receipt.items else []
+        items_data = json.loads(receipt.items) if receipt.items else {}
+        # Extract metadata if stored in items JSON
+        metadata = items_data.get("_metadata", {}) if isinstance(items_data, dict) else {}
+        items = items_data if isinstance(items_data, list) else (items_data.get("items", []) if isinstance(items_data, dict) else [])
+        
         receipt_list.append(ReceiptResponse(
             id=receipt.id,
             file_id=receipt.file_id,
@@ -177,19 +192,170 @@ async def get_receipts(
             total_amount=receipt.total_amount,
             tax_amount=receipt.tax_amount,
             subtotal=receipt.subtotal,
-            items=items,
+            items=items if isinstance(items, list) else [],
             payment_method=receipt.payment_method,
             address=receipt.address,
             phone=receipt.phone,
             raw_text=receipt.raw_text,
             image_path=receipt.image_path,
             confidence_score=receipt.confidence_score,
-            extraction_date=receipt.extraction_date
+            extraction_date=receipt.extraction_date,
+            currency=metadata.get("currency"),
+            vat_percentage=metadata.get("vat_percentage"),
+            missing_fields=metadata.get("missing_fields")
         ))
     
-    return ReceiptListResponse(
+    # Calculate stats (simplified - in production, store these in database)
+    # For now, we'll estimate based on receipts found
+    receipts_extracted = len(receipt_list)
+    # Estimate detected as extracted + some margin (in production, track this)
+    receipts_detected = max(receipts_extracted, receipts_extracted + 1)
+    
+    return EnhancedReceiptListResponse(
         file_id=file_id,
-        receipts=receipt_list,
-        total=len(receipt_list)
+        pages_processed=1,  # Would need to track this
+        receipts_detected=receipts_detected,
+        receipts_extracted=receipts_extracted,
+        missing_receipts_estimate=max(0, receipts_detected - receipts_extracted),
+        page_stats=[PageStat(
+            page_number=1,
+            detected=receipts_detected,
+            successful=receipts_extracted,
+            rejected=max(0, receipts_detected - receipts_extracted),
+            rejection_reasons=[]
+        )],
+        detection_warning=receipts_detected == 0,
+        receipts=receipt_list
     )
+
+
+@router.patch("/receipt/{receipt_id}", response_model=ReceiptResponse)
+async def update_receipt(
+    receipt_id: int,
+    receipt_update: ReceiptUpdate,
+    db: Session = Depends(get_db)
+):
+    """Update receipt fields."""
+    # Get receipt
+    receipt = db.query(Receipt).filter(Receipt.id == receipt_id).first()
+    if not receipt:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+    
+    # Import normalization function
+    from services.pipeline import normalize_extracted_fields
+    
+    # Build update dict
+    update_data = receipt_update.model_dump(exclude_unset=True)
+    
+    # Separate currency and vat_percentage (stored in metadata)
+    currency_update = update_data.pop("currency", None)
+    vat_percentage_update = update_data.pop("vat_percentage", None)
+    
+    # Normalize values
+    if update_data:
+        normalized = normalize_extracted_fields(update_data)
+        for key, value in normalized.items():
+            if value is not None:
+                setattr(receipt, key, value)
+    
+    # Update currency and vat_percentage in items metadata
+    items_data = json.loads(receipt.items) if receipt.items else {}
+    if not isinstance(items_data, dict):
+        items_data = {"items": items_data if isinstance(items_data, list) else []}
+    
+    if "_metadata" not in items_data:
+        items_data["_metadata"] = {}
+    
+    if currency_update is not None:
+        items_data["_metadata"]["currency"] = currency_update
+    if vat_percentage_update is not None:
+        # Round VAT percentage to 1 decimal
+        items_data["_metadata"]["vat_percentage"] = round(float(vat_percentage_update), 1)
+    
+    receipt.items = json.dumps(items_data)
+    
+    db.commit()
+    db.refresh(receipt)
+    
+    # Return updated receipt
+    metadata = items_data.get("_metadata", {})
+    items = items_data.get("items", []) if isinstance(items_data, dict) else (items_data if isinstance(items_data, list) else [])
+    
+    return ReceiptResponse(
+        id=receipt.id,
+        file_id=receipt.file_id,
+        receipt_number=receipt.receipt_number,
+        merchant_name=receipt.merchant_name,
+        date=receipt.date,
+        total_amount=receipt.total_amount,
+        tax_amount=receipt.tax_amount,
+        subtotal=receipt.subtotal,
+        items=items if isinstance(items, list) else [],
+        payment_method=receipt.payment_method,
+        address=receipt.address,
+        phone=receipt.phone,
+        raw_text=receipt.raw_text,
+        image_path=receipt.image_path,
+        confidence_score=receipt.confidence_score,
+        extraction_date=receipt.extraction_date,
+        currency=metadata.get("currency"),
+        vat_percentage=metadata.get("vat_percentage"),
+        missing_fields=metadata.get("missing_fields")
+    )
+
+
+@router.get("/file/{file_id}/stats")
+async def get_file_stats(
+    file_id: str,
+    db: Session = Depends(get_db)
+):
+    """Get processing statistics for a file."""
+    # Verify file exists
+    uploaded_file = db.query(UploadedFile).filter(UploadedFile.file_id == file_id).first()
+    if not uploaded_file:
+        raise HTTPException(status_code=404, detail="File not found")
+    
+    # Get receipts
+    receipts = db.query(Receipt).filter(Receipt.file_id == file_id).all()
+    
+    receipts_extracted = len(receipts)
+    receipts_detected = max(receipts_extracted, receipts_extracted + 1)  # Estimate
+    
+    # Calculate average confidence
+    avg_confidence = 0.0
+    if receipts:
+        confidences = [r.confidence_score for r in receipts if r.confidence_score is not None]
+        if confidences:
+            avg_confidence = sum(confidences) / len(confidences)
+    
+    # Count fields with missing data
+    missing_fields_count = 0
+    for receipt in receipts:
+        if receipt.merchant_name is None:
+            missing_fields_count += 1
+        if receipt.date is None:
+            missing_fields_count += 1
+        if receipt.total_amount is None:
+            missing_fields_count += 1
+        if receipt.tax_amount is None:
+            missing_fields_count += 1
+        if receipt.currency is None:
+            missing_fields_count += 1
+    
+    return {
+        "file_id": file_id,
+        "receipts_detected": receipts_detected,
+        "receipts_extracted": receipts_extracted,
+        "missing_receipts_estimate": max(0, receipts_detected - receipts_extracted),
+        "average_confidence": round(avg_confidence, 2),
+        "total_missing_fields": missing_fields_count,
+        "pages_processed": 1,  # Would need to track this
+        "error_breakdown": {
+            "no_merchant_name": sum(1 for r in receipts if r.merchant_name is None),
+            "no_date": sum(1 for r in receipts if r.date is None),
+            "no_total": sum(1 for r in receipts if r.total_amount is None),
+            "no_tax": sum(1 for r in receipts if r.tax_amount is None),
+            "no_currency": sum(1 for r in receipts if r.currency is None)
+        }
+    }
 

@@ -31,7 +31,7 @@ class Settings(BaseSettings):
     # Ollama LLM Settings
     OLLAMA_BASE_URL: str = "http://localhost:11434"
     OLLAMA_MODEL: str = "gemma3:latest"  # Default model, will auto-fallback to first available if not found
-    OLLAMA_TIMEOUT: int = 300  # 5 minutes per receipt (increased for complex receipts)
+    OLLAMA_TIMEOUT: int = 480  # 8 minutes per receipt (increased for international receipts with complex VAT calculations)
     
     # Processing Settings
     MAX_FILE_SIZE_MB: int = 50

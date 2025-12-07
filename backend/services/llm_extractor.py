@@ -21,7 +21,7 @@ def extract_fields_llm(ocr_text: str) -> Dict[str, Any]:
     Returns:
         Dictionary with extracted fields
     """
-    prompt = f"""You are a receipt data extraction expert. Extract structured data from the following receipt text (which may contain OCR errors).
+    prompt = f"""You are a receipt data extraction expert. Extract structured data from the following receipt text (which may contain OCR errors). The receipt may be from any country.
 
 CRITICAL JSON FORMATTING RULES:
 1. Use `null` (not `null.00`, `null.0`, or any other variant) for missing/unknown values
@@ -37,7 +37,7 @@ REQUIRED JSON SCHEMA:
   "total_amount": float or null,
   "tax_amount": float or null,
   "subtotal": float or null,
-  "currency": "string (3-letter code: EUR, USD, GBP, etc.) or null",
+  "currency": "string (3-letter code: EUR, USD, GBP, CAD, AUD, etc.) or null",
   "items": [{{"name": "string", "quantity": float, "price": float, "total": float}}] or [],
   "payment_method": "string or null",
   "address": "string or null",
@@ -48,44 +48,107 @@ REQUIRED JSON SCHEMA:
 
 EXTRACTION GUIDELINES:
 
-1. MERCHANT_NAME: Extract the store/company name (usually at the top). Common Dutch stores: Albert Heijn (AH), Jumbo, Plus, Coop, etc.
+1. MERCHANT_NAME: Extract the store/company name (usually at the top). Examples: Albert Heijn (AH), Walmart, Tesco, Carrefour, etc.
 
 2. DATE: 
-   - Dutch format: "15-07-2022" or "15/07/2022" → convert to "2022-07-15"
-   - English format: "Jul 15, 2022" → convert to "2022-07-15"
+   - Detect format based on receipt language/country:
+     * Dutch/German: "15-07-2022" or "15/07/2022" → "2022-07-15"
+     * US: "Jul 15, 2022" or "07/15/2022" → "2022-07-15"
+     * UK: "15/07/2022" → "2022-07-15"
+     * ISO: "2022-07-15" → keep as is
+   - Look for keywords: "Datum" (Dutch/German), "Date" (English), "Fecha" (Spanish), "Data" (Italian/Portuguese)
    - If unclear, keep original format as string
-   - Look for keywords: "Datum", "Date", "Bon datum"
 
 3. TOTAL_AMOUNT: 
-   - Look for "Totaal", "Total", "Totaalbedrag", "Eindtotaal", "Totaal incl. BTW"
-   - Remove currency symbols (€, EUR, etc.) and commas used as decimal separators
-   - Convert "9,72" to 9.72, "€12.50" to 12.50
+   - Look for total keywords in various languages:
+     * English: "Total", "Amount", "Sum", "Grand Total"
+     * Dutch: "Totaal", "Totaalbedrag", "Eindtotaal"
+     * German: "Gesamt", "Summe", "Endbetrag"
+     * French: "Total", "Montant total"
+     * Spanish: "Total", "Importe total"
+   - Remove currency symbols (€, $, £, ¥, etc.) and handle decimal separators:
+     * European format: "9,72" → 9.72 (comma as decimal)
+     * US/UK format: "9.72" → 9.72 (period as decimal)
+     * Some countries use space as thousands separator: "1 234,56" → 1234.56
 
 4. TAX_AMOUNT / VAT_AMOUNT:
-   - Dutch receipts use "BTW" (Belasting Toegevoegde Waarde)
-   - Look for "BTW", "VAT", "Tax", "Belasting"
-   - Can be same as tax_amount field
+   - Detect tax terminology based on country:
+     * Netherlands: "BTW" (Belasting Toegevoegde Waarde) = VAT
+     * UK/Ireland: "VAT" (Value Added Tax)
+     * US/Canada: "Tax", "Sales Tax", "GST" (Goods and Services Tax)
+     * Australia/New Zealand: "GST" (Goods and Services Tax)
+     * Germany/Austria: "MwSt" (Mehrwertsteuer) = VAT
+     * France: "TVA" (Taxe sur la valeur ajoutée) = VAT
+     * Spain: "IVA" (Impuesto sobre el valor añadido) = VAT
+     * Italy: "IVA" (Imposta sul valore aggiunto) = VAT
+   
+   - IMPORTANT: Determine if total INCLUDES or EXCLUDES tax:
+     * "Total incl. VAT/BTW/TVA/IVA" or "Totaal incl. BTW" → total INCLUDES tax
+     * "Total excl. VAT" or "Subtotal" → total EXCLUDES tax
+     * "Total" alone → usually includes tax in EU, excludes in US
+   
+   - If total INCLUDES tax (common in EU):
+     * total_amount = total shown
+     * tax_amount = tax/VAT amount shown
+     * subtotal = total_amount - tax_amount
+   
+   - If total EXCLUDES tax (common in US/Canada):
+     * subtotal = subtotal shown
+     * tax_amount = tax amount shown
+     * total_amount = subtotal + tax_amount
+   
+   - If you see separate tax rates (e.g., "VAT 9%" and "VAT 21%"), SUM them for total tax
+   - tax_amount and vat_amount should be the SAME value (they're synonyms)
 
 5. CURRENCY:
-   - Default to "EUR" for Dutch receipts (Netherlands uses Euro)
-   - Look for currency symbols: € = EUR, $ = USD, £ = GBP
-   - If not found but receipt is clearly Dutch, use "EUR"
+   - Detect from currency symbols or text:
+     * € = EUR (Euro - EU, some African countries)
+     * $ = USD (US Dollar - US, Canada, Australia, etc. - check context)
+     * £ = GBP (British Pound - UK)
+     * ¥ = JPY (Japanese Yen) or CNY (Chinese Yuan - check context)
+     * ₹ = INR (Indian Rupee)
+     * CHF = Swiss Franc
+     * CAD = Canadian Dollar (if $ with Canadian context)
+     * AUD = Australian Dollar (if $ with Australian context)
+   - Look for currency codes in text: "EUR", "USD", "GBP", etc.
+   - If not found, infer from country context or use null
 
 6. ITEMS:
    - Extract line items if clearly listed
    - Each item: name, quantity (if shown), price per unit, total
+   - If items show tax/VAT rates, note it but don't include in item object
    - If items are not clearly separated, use empty array []
 
 7. PAYMENT_METHOD:
-   - Look for: "Contant", "Cash", "PIN", "Debit", "Credit Card", "Creditcard", "iDEAL", etc.
+   - Look for payment terms in various languages:
+     * English: "Cash", "Credit Card", "Debit Card", "Card"
+     * Dutch: "Contant", "PIN", "iDEAL"
+     * German: "Bar", "Karte", "EC-Karte"
+     * French: "Espèces", "Carte", "CB"
+     * Spanish: "Efectivo", "Tarjeta"
 
 8. ADDRESS: Full store address if available
 
 9. PHONE: Phone number in any format
 
 10. VAT_PERCENTAGE:
-    - Common Dutch VAT rates: 9% (low rate), 21% (standard rate)
-    - Calculate if you have tax_amount and total_amount: (tax_amount / (total_amount - tax_amount)) * 100
+    - Common VAT rates by country:
+      * Netherlands: 9% (low), 21% (standard)
+      * UK: 0%, 5%, 20%
+      * Germany: 7% (reduced), 19% (standard)
+      * France: 5.5%, 10%, 20%
+      * US: varies by state (0-10% typically)
+      * Canada: 5% GST + provincial tax (varies)
+    
+    - Calculate based on whether total includes or excludes tax:
+      * If total INCLUDES tax: VAT% = (tax_amount / (total_amount - tax_amount)) * 100
+      * If total EXCLUDES tax: VAT% = (tax_amount / subtotal) * 100
+    
+    - Example (total includes tax): total=10.00, tax=1.74 → VAT% = (1.74 / (10.00 - 1.74)) * 100 = 21.07%
+    - Example (total excludes tax): subtotal=8.26, tax=1.74 → VAT% = (1.74 / 8.26) * 100 = 21.07%
+    
+    - If receipt shows multiple tax rates, calculate effective/weighted rate
+    - If calculation is unclear, use the most common rate shown or null
 
 HANDLING OCR ERRORS:
 - If text is unclear or garbled, use null for that field

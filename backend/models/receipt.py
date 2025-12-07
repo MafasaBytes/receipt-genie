@@ -50,6 +50,9 @@ class ReceiptResponse(BaseModel):
     image_path: Optional[str] = None
     confidence_score: Optional[float] = None
     extraction_date: Optional[datetime] = None
+    currency: Optional[str] = None
+    vat_percentage: Optional[float] = None
+    missing_fields: Optional[Dict[str, Any]] = None  # Metadata for missing fields
     
     class Config:
         from_attributes = True
@@ -87,4 +90,35 @@ class ReceiptListResponse(BaseModel):
     file_id: str
     receipts: List[ReceiptResponse]
     total: int
+
+
+class PageStat(BaseModel):
+    """Schema for per-page statistics."""
+    page_number: int
+    detected: int
+    successful: int
+    rejected: int
+    rejection_reasons: List[str] = []
+
+
+class EnhancedReceiptListResponse(BaseModel):
+    """Enhanced schema for receipt list with processing stats."""
+    file_id: str
+    pages_processed: int
+    receipts_detected: int
+    receipts_extracted: int
+    missing_receipts_estimate: int
+    page_stats: List[PageStat]
+    detection_warning: bool
+    receipts: List[ReceiptResponse]
+
+
+class ReceiptUpdate(BaseModel):
+    """Schema for updating receipt fields."""
+    merchant_name: Optional[str] = None
+    date: Optional[str] = None
+    total_amount: Optional[float] = None
+    tax_amount: Optional[float] = None
+    vat_percentage: Optional[float] = None
+    currency: Optional[str] = None
 

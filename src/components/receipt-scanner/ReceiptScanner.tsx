@@ -1,12 +1,14 @@
 import { useState, useCallback } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { Scan, RotateCcw, Loader2 } from "lucide-react";
+import { Scan, RotateCcw, Loader2, AlertTriangle } from "lucide-react";
 import { Button } from "@/components/ui/button";
 import { FileUploader } from "./FileUploader";
 import { ProcessingSteps } from "./ProcessingSteps";
 import { ReceiptsTable } from "./ReceiptsTable";
+import { EditableReceiptTable } from "./EditableReceiptTable";
 import { ExportButtons } from "./ExportButtons";
-import { Receipt, ProcessingStatus, UploadResponse } from "@/types/receipt";
+import { ProcessingSummaryModal } from "./ProcessingSummaryModal";
+import { Receipt, ProcessingStatus, UploadResponse, ProcessResult } from "@/types/receipt";
 import { uploadPdf, processPdf } from "@/services/api";
 import { toast } from "@/hooks/use-toast";
 
@@ -14,6 +16,8 @@ export function ReceiptScanner() {
   const [file, setFile] = useState<File | null>(null);
   const [uploadResponse, setUploadResponse] = useState<UploadResponse | null>(null);
   const [receipts, setReceipts] = useState<Receipt[]>([]);
+  const [processingStats, setProcessingStats] = useState<any>(null);
+  const [showSummaryModal, setShowSummaryModal] = useState(false);
   const [status, setStatus] = useState<ProcessingStatus>({
     status: 'idle',
     progress: 0,
@@ -63,7 +67,7 @@ export function ReceiptScanner() {
         message: 'Processing receipts...'
       });
 
-      const extractedReceipts = await processPdf(
+      const result: ProcessResult = await processPdf(
         uploadResult.file_id,
         (progress) => {
           setStatus(prev => ({
@@ -72,26 +76,32 @@ export function ReceiptScanner() {
             message: progress < 30 
               ? 'Converting PDF to images...'
               : progress < 50 
-                ? 'Detecting receipts...'
+                ? 'Detecting receipts on pages...'
                 : progress < 70 
-                  ? 'Running OCR...'
-                  : progress < 90 
-                    ? 'Extracting fields with AI...'
-                    : 'Finalizing...'
+                  ? 'Running OCR on detected receipts...'
+                : progress < 90 
+                  ? 'Extracting fields with AI...'
+                  : 'Finalizing and normalizing data...'
           }));
         }
       );
 
-      setReceipts(extractedReceipts);
+      setReceipts(result.receipts);
+      setProcessingStats(result.stats);
       setStatus({
         status: 'completed',
         progress: 100,
-        message: `Successfully extracted ${extractedReceipts.length} receipt${extractedReceipts.length !== 1 ? 's' : ''}`
+        message: `Successfully extracted ${result.receipts.length} receipt${result.receipts.length !== 1 ? 's' : ''}`
       });
+
+      // Show summary modal if stats available
+      if (result.stats) {
+        setShowSummaryModal(true);
+      }
 
       toast({
         title: "Processing complete",
-        description: `Found ${extractedReceipts.length} receipt${extractedReceipts.length !== 1 ? 's' : ''} in your document.`
+        description: `Found ${result.receipts.length} receipt${result.receipts.length !== 1 ? 's' : ''} in your document.`
       });
 
     } catch (error) {
@@ -205,7 +215,7 @@ export function ReceiptScanner() {
                 </p>
               </div>
               <div className="flex items-center gap-3">
-                <ExportButtons receipts={receipts} disabled={isProcessing} />
+                <ExportButtons fileId={uploadResponse?.file_id || null} disabled={isProcessing} />
                 <Button
                   variant="ghost"
                   size="icon"
@@ -217,11 +227,49 @@ export function ReceiptScanner() {
               </div>
             </div>
 
-            {/* Results Table */}
-            <ReceiptsTable receipts={receipts} />
+            {/* Detection Warning Banner */}
+            {processingStats && processingStats.detection_warning && (
+              <motion.div
+                initial={{ opacity: 0, y: -10 }}
+                animate={{ opacity: 1, y: 0 }}
+                className="p-4 rounded-lg border border-yellow-200 dark:border-yellow-800 bg-yellow-50 dark:bg-yellow-900/20"
+              >
+                <div className="flex items-start gap-3">
+                  <AlertTriangle className="h-5 w-5 text-yellow-600 dark:text-yellow-400 mt-0.5 flex-shrink-0" />
+                  <div>
+                    <div className="font-semibold text-yellow-800 dark:text-yellow-200">
+                      Detection Warning
+                    </div>
+                    <div className="text-sm text-yellow-700 dark:text-yellow-300 mt-1">
+                      Some receipts may not have been detected. Review the detected receipts or edit missing values manually.
+                    </div>
+                  </div>
+                </div>
+              </motion.div>
+            )}
+
+            {/* Results Table - Editable */}
+            <EditableReceiptTable 
+              receipts={receipts}
+              onReceiptUpdate={(receiptId, updates) => {
+                setReceipts(prev => prev.map(r => 
+                  r.id === receiptId ? { ...r, ...updates, modified: true } : r
+                ));
+              }}
+            />
           </motion.div>
         )}
       </AnimatePresence>
+
+      {/* Processing Summary Modal */}
+      {processingStats && (
+        <ProcessingSummaryModal
+          open={showSummaryModal}
+          onOpenChange={setShowSummaryModal}
+          stats={processingStats}
+          receiptsCount={receipts.length}
+        />
+      )}
     </div>
   );
 }

@@ -34,7 +34,7 @@ export function FileUploader({
     if (disabled) return;
     
     const file = e.dataTransfer.files[0];
-    if (file && file.type === "application/pdf") {
+    if (file && (file.type === "application/pdf" || file.type.startsWith("image/"))) {
       onFileSelect(file);
     }
   }, [onFileSelect, disabled]);
@@ -76,7 +76,7 @@ export function FileUploader({
             <input
               type="file"
               className="hidden"
-              accept=".pdf,application/pdf"
+              accept=".pdf,application/pdf,image/png,image/jpeg,image/jpg,image/bmp,image/tiff,image/webp"
               onChange={handleFileInput}
               disabled={disabled}
             />
@@ -89,10 +89,10 @@ export function FileUploader({
               </div>
               <div className="text-center">
                 <p className="text-sm font-medium text-foreground">
-                  Drop your PDF here or click to browse
+                  Drop your PDF or image here or click to browse
                 </p>
                 <p className="text-xs text-muted-foreground mt-1">
-                  Supports PDF files with receipt images
+                  Supports PDF files and images (PNG, JPG, JPEG, BMP, TIFF, WEBP)
                 </p>
               </div>
             </motion.div>

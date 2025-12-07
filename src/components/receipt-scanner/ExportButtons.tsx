@@ -1,23 +1,31 @@
 import { motion } from "framer-motion";
 import { FileSpreadsheet, FileDown, Loader2 } from "lucide-react";
 import { Button } from "@/components/ui/button";
-import { Receipt } from "@/types/receipt";
 import { downloadCsv, downloadExcel } from "@/services/api";
 import { useState } from "react";
 import { toast } from "@/hooks/use-toast";
 
 interface ExportButtonsProps {
-  receipts: Receipt[];
+  fileId: string | null;
   disabled?: boolean;
 }
 
-export function ExportButtons({ receipts, disabled }: ExportButtonsProps) {
+export function ExportButtons({ fileId, disabled }: ExportButtonsProps) {
   const [exporting, setExporting] = useState<'csv' | 'excel' | null>(null);
 
   const handleExportCsv = async () => {
+    if (!fileId) {
+      toast({
+        title: "Export failed",
+        description: "No file ID available.",
+        variant: "destructive"
+      });
+      return;
+    }
+    
     setExporting('csv');
     try {
-      await downloadCsv(receipts);
+      await downloadCsv(fileId);
       toast({
         title: "Export successful",
         description: "Your CSV file has been downloaded."
@@ -34,9 +42,18 @@ export function ExportButtons({ receipts, disabled }: ExportButtonsProps) {
   };
 
   const handleExportExcel = async () => {
+    if (!fileId) {
+      toast({
+        title: "Export failed",
+        description: "No file ID available.",
+        variant: "destructive"
+      });
+      return;
+    }
+    
     setExporting('excel');
     try {
-      await downloadExcel(receipts);
+      await downloadExcel(fileId);
       toast({
         title: "Export successful",
         description: "Your Excel file has been downloaded."
