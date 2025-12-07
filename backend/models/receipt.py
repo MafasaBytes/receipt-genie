@@ -10,8 +10,19 @@ class ReceiptItem(BaseModel):
     """Schema for a single receipt item."""
     name: Optional[str] = None
     quantity: Optional[float] = None
+    unit_price: Optional[float] = None
+    line_total: Optional[float] = None
+    vat_rate: Optional[float] = None
+    # Legacy fields for backward compatibility
     price: Optional[float] = None
     total: Optional[float] = None
+
+
+class VATBreakdownEntry(BaseModel):
+    """Schema for a VAT breakdown entry."""
+    vat_rate: float
+    tax_amount: Optional[float] = None
+    base_amount: Optional[float] = None
 
 
 class ReceiptCreate(BaseModel):
@@ -43,6 +54,8 @@ class ReceiptResponse(BaseModel):
     tax_amount: Optional[float] = None
     subtotal: Optional[float] = None
     items: Optional[List[Dict[str, Any]]] = None
+    vat_breakdown: Optional[List[Dict[str, Any]]] = None
+    vat_percentage_effective: Optional[float] = None
     payment_method: Optional[str] = None
     address: Optional[str] = None
     phone: Optional[str] = None
@@ -51,7 +64,7 @@ class ReceiptResponse(BaseModel):
     confidence_score: Optional[float] = None
     extraction_date: Optional[datetime] = None
     currency: Optional[str] = None
-    vat_percentage: Optional[float] = None
+    vat_percentage: Optional[float] = None  # Legacy field, maps to vat_percentage_effective
     missing_fields: Optional[Dict[str, Any]] = None  # Metadata for missing fields
     
     class Config:
@@ -119,6 +132,9 @@ class ReceiptUpdate(BaseModel):
     date: Optional[str] = None
     total_amount: Optional[float] = None
     tax_amount: Optional[float] = None
+    subtotal: Optional[float] = None
+    items: Optional[List[Dict[str, Any]]] = None
+    vat_breakdown: Optional[List[Dict[str, Any]]] = None
     vat_percentage: Optional[float] = None
     currency: Optional[str] = None
 

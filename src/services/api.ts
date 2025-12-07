@@ -189,8 +189,10 @@ function mapBackendReceiptsToFrontend(backendReceipts: any[]): Receipt[] {
       }
     }
     
-    // If backend already provided vat_percentage, use it (most accurate)
-    if (receipt.vat_percentage !== null && receipt.vat_percentage !== undefined) {
+    // If backend already provided vat_percentage or vat_percentage_effective, use it (most accurate)
+    if (receipt.vat_percentage_effective !== null && receipt.vat_percentage_effective !== undefined) {
+      vatPercentage = receipt.vat_percentage_effective;
+    } else if (receipt.vat_percentage !== null && receipt.vat_percentage !== undefined) {
       vatPercentage = receipt.vat_percentage;
     }
     
@@ -201,6 +203,9 @@ function mapBackendReceiptsToFrontend(backendReceipts: any[]): Receipt[] {
       total_amount: receipt.total_amount || null,
       vat_amount: receipt.tax_amount || null,
       vat_percentage: vatPercentage,
+      vat_percentage_effective: receipt.vat_percentage_effective || null,
+      vat_breakdown: receipt.vat_breakdown || null,
+      items: receipt.items || null,
       currency: receipt.currency || "EUR", // Default to EUR if not detected (safety fallback)
       confidence_score: receipt.confidence_score || null
     };

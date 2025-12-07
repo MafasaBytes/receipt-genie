@@ -1,7 +1,7 @@
 """
 SQLAlchemy database models.
 """
-from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey
+from sqlalchemy import Column, Integer, String, Float, DateTime, Text, ForeignKey, JSON
 from sqlalchemy.orm import relationship
 from sqlalchemy.sql import func
 from database import Base
@@ -38,6 +38,9 @@ class Receipt(Base):
     tax_amount = Column(Float, nullable=True)
     subtotal = Column(Float, nullable=True)
     items = Column(Text, nullable=True)  # JSON string of items
+    # JSON type works with both SQLite (stored as TEXT) and MySQL/PostgreSQL
+    vat_breakdown = Column(JSON, nullable=True)  # JSON array of VAT breakdown entries
+    vat_percentage_effective = Column(Float, nullable=True)  # Weighted effective VAT percentage
     payment_method = Column(String(100), nullable=True)
     address = Column(String(500), nullable=True)
     phone = Column(String(50), nullable=True)

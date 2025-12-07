@@ -193,6 +193,8 @@ async def get_receipts(
             tax_amount=receipt.tax_amount,
             subtotal=receipt.subtotal,
             items=items if isinstance(items, list) else [],
+            vat_breakdown=receipt.vat_breakdown if receipt.vat_breakdown else [],
+            vat_percentage_effective=receipt.vat_percentage_effective,
             payment_method=receipt.payment_method,
             address=receipt.address,
             phone=receipt.phone,
@@ -201,7 +203,7 @@ async def get_receipts(
             confidence_score=receipt.confidence_score,
             extraction_date=receipt.extraction_date,
             currency=metadata.get("currency"),
-            vat_percentage=metadata.get("vat_percentage"),
+            vat_percentage=receipt.vat_percentage_effective or metadata.get("vat_percentage"),
             missing_fields=metadata.get("missing_fields")
         ))
     
@@ -235,28 +237,80 @@ async def update_receipt(
     receipt_update: ReceiptUpdate,
     db: Session = Depends(get_db)
 ):
-    """Update receipt fields."""
+    """Update receipt fields. If items or vat_breakdown are updated, re-runs reconciliation."""
     # Get receipt
     receipt = db.query(Receipt).filter(Receipt.id == receipt_id).first()
     if not receipt:
         raise HTTPException(status_code=404, detail="Receipt not found")
     
-    # Import normalization function
+    # Import functions
     from services.pipeline import normalize_extracted_fields
+    from services.llm_extractor import reconcile_vat_and_items
     
     # Build update dict
     update_data = receipt_update.model_dump(exclude_unset=True)
     
-    # Separate currency and vat_percentage (stored in metadata)
+    # Separate fields that need special handling
     currency_update = update_data.pop("currency", None)
     vat_percentage_update = update_data.pop("vat_percentage", None)
+    items_update = update_data.pop("items", None)
+    vat_breakdown_update = update_data.pop("vat_breakdown", None)
     
-    # Normalize values
+    # Check if we need to re-run reconciliation
+    needs_reconciliation = items_update is not None or vat_breakdown_update is not None
+    
+    # Normalize basic fields
     if update_data:
         normalized = normalize_extracted_fields(update_data)
         for key, value in normalized.items():
             if value is not None:
                 setattr(receipt, key, value)
+    
+    # Handle items update
+    if items_update is not None:
+        # Update items JSON
+        items_data = json.loads(receipt.items) if receipt.items else {}
+        if not isinstance(items_data, dict):
+            items_data = {"items": items_data if isinstance(items_data, list) else []}
+        
+        items_data["items"] = items_update
+        receipt.items = json.dumps(items_data)
+    
+    # Handle VAT breakdown update
+    if vat_breakdown_update is not None:
+        receipt.vat_breakdown = vat_breakdown_update
+    
+    # Re-run reconciliation if needed
+    if needs_reconciliation:
+        # Build extracted dict for reconciliation
+        extracted_dict = {
+            "merchant_name": receipt.merchant_name,
+            "date": receipt.date,
+            "total_amount": receipt.total_amount,
+            "tax_amount": receipt.tax_amount,
+            "subtotal": receipt.subtotal,
+            "currency": currency_update or (json.loads(receipt.items) if receipt.items else {}).get("_metadata", {}).get("currency"),
+            "items": items_update if items_update is not None else (json.loads(receipt.items) if receipt.items else {}).get("items", []),
+            "vat_breakdown": vat_breakdown_update if vat_breakdown_update is not None else receipt.vat_breakdown,
+            "payment_method": receipt.payment_method,
+            "address": receipt.address,
+            "phone": receipt.phone,
+        }
+        
+        # Reconcile
+        reconciled = reconcile_vat_and_items(extracted_dict, receipt.raw_text or "")
+        
+        # Update fields from reconciliation
+        receipt.vat_breakdown = reconciled.get("vat_breakdown", [])
+        receipt.vat_percentage_effective = reconciled.get("vat_percentage_effective")
+        
+        # Update totals if they changed
+        if reconciled.get("total_amount") is not None:
+            receipt.total_amount = reconciled["total_amount"]
+        if reconciled.get("tax_amount") is not None:
+            receipt.tax_amount = reconciled["tax_amount"]
+        if reconciled.get("subtotal") is not None:
+            receipt.subtotal = reconciled["subtotal"]
     
     # Update currency and vat_percentage in items metadata
     items_data = json.loads(receipt.items) if receipt.items else {}
@@ -271,6 +325,9 @@ async def update_receipt(
     if vat_percentage_update is not None:
         # Round VAT percentage to 1 decimal
         items_data["_metadata"]["vat_percentage"] = round(float(vat_percentage_update), 1)
+    elif receipt.vat_percentage_effective is not None:
+        # Use effective VAT if no explicit update
+        items_data["_metadata"]["vat_percentage"] = receipt.vat_percentage_effective
     
     receipt.items = json.dumps(items_data)
     
@@ -291,6 +348,8 @@ async def update_receipt(
         tax_amount=receipt.tax_amount,
         subtotal=receipt.subtotal,
         items=items if isinstance(items, list) else [],
+        vat_breakdown=receipt.vat_breakdown if receipt.vat_breakdown else [],
+        vat_percentage_effective=receipt.vat_percentage_effective,
         payment_method=receipt.payment_method,
         address=receipt.address,
         phone=receipt.phone,
@@ -299,7 +358,7 @@ async def update_receipt(
         confidence_score=receipt.confidence_score,
         extraction_date=receipt.extraction_date,
         currency=metadata.get("currency"),
-        vat_percentage=metadata.get("vat_percentage"),
+        vat_percentage=receipt.vat_percentage_effective,  # Use effective VAT
         missing_fields=metadata.get("missing_fields")
     )
 

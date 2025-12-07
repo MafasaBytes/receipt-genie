@@ -466,18 +466,23 @@ def process_pdf_pipeline(
                         # Create empty items structure with metadata
                         items_json = json.dumps([])
                     
-                    # Add metadata to items JSON (currency, vat_percentage, missing_fields)
+                    # Add metadata to items JSON (currency, vat_percentage_effective, missing_fields)
                     items_data = json.loads(items_json) if items_json else []
                     if isinstance(items_data, list):
                         metadata_obj = {
                             "_metadata": {
                                 "currency": extracted_fields.get("currency"),
-                                "vat_percentage": extracted_fields.get("vat_percentage"),
+                                "vat_percentage": extracted_fields.get("vat_percentage_effective"),  # Use effective VAT
                                 "missing_fields": missing_metadata
                             }
                         }
                         # Store metadata separately - we'll extract it in response
                         items_json = json.dumps({"items": items_data, "_metadata": metadata_obj["_metadata"]})
+                    
+                    # Extract VAT breakdown for database storage
+                    vat_breakdown_json = None
+                    if extracted_fields.get("vat_breakdown"):
+                        vat_breakdown_json = extracted_fields["vat_breakdown"]
                     
                     receipt_data = ReceiptCreate(
                         file_id=file_id,
@@ -506,6 +511,8 @@ def process_pdf_pipeline(
                         tax_amount=receipt_data.tax_amount,
                         subtotal=receipt_data.subtotal,
                         items=items_json,
+                        vat_breakdown=vat_breakdown_json,
+                        vat_percentage_effective=extracted_fields.get("vat_percentage_effective"),
                         payment_method=receipt_data.payment_method,
                         address=receipt_data.address,
                         phone=receipt_data.phone,
@@ -538,6 +545,8 @@ def process_pdf_pipeline(
                         "tax_amount": db_receipt.tax_amount,
                         "subtotal": db_receipt.subtotal,
                         "items": items_list,
+                        "vat_breakdown": db_receipt.vat_breakdown if db_receipt.vat_breakdown else [],
+                        "vat_percentage_effective": db_receipt.vat_percentage_effective,
                         "payment_method": db_receipt.payment_method,
                         "address": db_receipt.address,
                         "phone": db_receipt.phone,
@@ -546,7 +555,7 @@ def process_pdf_pipeline(
                         "confidence_score": db_receipt.confidence_score,
                         "extraction_date": db_receipt.extraction_date,
                         "currency": metadata.get("currency") or extracted_fields.get("currency"),
-                        "vat_percentage": metadata.get("vat_percentage") or extracted_fields.get("vat_percentage"),
+                        "vat_percentage": db_receipt.vat_percentage_effective,  # Use effective VAT
                         "missing_fields": metadata.get("missing_fields") or missing_metadata
                     }
                     

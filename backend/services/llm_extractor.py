@@ -5,7 +5,7 @@ import json
 import re
 import requests
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -21,157 +21,55 @@ def extract_fields_llm(ocr_text: str) -> Dict[str, Any]:
     Returns:
         Dictionary with extracted fields
     """
-    prompt = f"""You are a receipt data extraction expert. Extract structured data from the following receipt text (which may contain OCR errors). The receipt may be from any country.
+    prompt = f"""You are a receipt data extraction expert. Extract structured data from the receipt OCR text below.
 
-CRITICAL JSON FORMATTING RULES:
-1. Use `null` (not `null.00`, `null.0`, or any other variant) for missing/unknown values
-2. Use proper JSON syntax: no trailing commas, proper quotes, etc.
-3. Return ONLY valid JSON, no markdown code blocks, no explanations, no additional text
-4. All numbers must be valid floats (e.g., 9.72, not "9,72" or "€9.72")
-5. Dates should be in YYYY-MM-DD format if possible, otherwise use the original format as string
+CRITICAL RULES:
+- Output ONLY valid JSON. No explanations. No markdown.
+- Use null for missing values.
+- Numbers must be floats (e.g., 9.72).
+- VAT should always be expressed as a percentage (e.g., 21.0, 9.0).
+- If multiple VAT rates appear, list them ALL in vat_breakdown.
 
-REQUIRED JSON SCHEMA:
+JSON SCHEMA TO RETURN:
 {{
   "merchant_name": "string or null",
-  "date": "string (YYYY-MM-DD preferred) or null",
+  "date": "string or null",
+  "currency": "string or null",
   "total_amount": float or null,
   "tax_amount": float or null,
   "subtotal": float or null,
-  "currency": "string (3-letter code: EUR, USD, GBP, CAD, AUD, etc.) or null",
-  "items": [{{"name": "string", "quantity": float, "price": float, "total": float}}] or [],
+
+  "items": [
+    {{
+      "name": "string or null",
+      "quantity": float or null,
+      "unit_price": float or null,
+      "line_total": float or null,
+      "vat_rate": float or null
+    }}
+  ],
+
+  "vat_breakdown": [
+    {{
+      "vat_rate": float,
+      "tax_amount": float or null,
+      "base_amount": float or null
+    }}
+  ],
+
   "payment_method": "string or null",
   "address": "string or null",
-  "phone": "string or null",
-  "vat_amount": float or null,
-  "vat_percentage": float or null
+  "phone": "string or null"
 }}
 
-EXTRACTION GUIDELINES:
+Extraction guidelines:
+- If multiple VAT lines appear (e.g., 21% and 9%), include both in vat_breakdown.
+- If item lines include VAT, include the vat_rate per item.
+- If receipt totals are tax-included, compute base amounts using base = total / (1 + rate).
+- If receipt totals are tax-excluded, compute tax = base * rate.
+- If only one VAT rate is visible, still return a single vat_breakdown entry.
 
-1. MERCHANT_NAME: Extract the store/company name (usually at the top). Examples: Albert Heijn (AH), Walmart, Tesco, Carrefour, etc.
-
-2. DATE: 
-   - Detect format based on receipt language/country:
-     * Dutch/German: "15-07-2022" or "15/07/2022" → "2022-07-15"
-     * US: "Jul 15, 2022" or "07/15/2022" → "2022-07-15"
-     * UK: "15/07/2022" → "2022-07-15"
-     * ISO: "2022-07-15" → keep as is
-   - Look for keywords: "Datum" (Dutch/German), "Date" (English), "Fecha" (Spanish), "Data" (Italian/Portuguese)
-   - If unclear, keep original format as string
-
-3. TOTAL_AMOUNT: 
-   - Look for total keywords in various languages:
-     * English: "Total", "Amount", "Sum", "Grand Total"
-     * Dutch: "Totaal", "Totaalbedrag", "Eindtotaal"
-     * German: "Gesamt", "Summe", "Endbetrag"
-     * French: "Total", "Montant total"
-     * Spanish: "Total", "Importe total"
-   - Remove currency symbols (€, $, £, ¥, etc.) and handle decimal separators:
-     * European format: "9,72" → 9.72 (comma as decimal)
-     * US/UK format: "9.72" → 9.72 (period as decimal)
-     * Some countries use space as thousands separator: "1 234,56" → 1234.56
-
-4. TAX_AMOUNT / VAT_AMOUNT:
-   - Detect tax terminology based on country:
-     * Netherlands: "BTW" (Belasting Toegevoegde Waarde) = VAT
-     * UK/Ireland: "VAT" (Value Added Tax)
-     * US/Canada: "Tax", "Sales Tax", "GST" (Goods and Services Tax)
-     * Australia/New Zealand: "GST" (Goods and Services Tax)
-     * Germany/Austria: "MwSt" (Mehrwertsteuer) = VAT
-     * France: "TVA" (Taxe sur la valeur ajoutée) = VAT
-     * Spain: "IVA" (Impuesto sobre el valor añadido) = VAT
-     * Italy: "IVA" (Imposta sul valore aggiunto) = VAT
-   
-   - IMPORTANT: Determine if total INCLUDES or EXCLUDES tax:
-     * "Total incl. VAT/BTW/TVA/IVA" or "Totaal incl. BTW" → total INCLUDES tax
-     * "Total excl. VAT" or "Subtotal" → total EXCLUDES tax
-     * "Total" alone → usually includes tax in EU, excludes in US
-   
-   - If total INCLUDES tax (common in EU):
-     * total_amount = total shown
-     * tax_amount = tax/VAT amount shown
-     * subtotal = total_amount - tax_amount
-   
-   - If total EXCLUDES tax (common in US/Canada):
-     * subtotal = subtotal shown
-     * tax_amount = tax amount shown
-     * total_amount = subtotal + tax_amount
-   
-   - If you see separate tax rates (e.g., "VAT 9%" and "VAT 21%"), SUM them for total tax
-   - tax_amount and vat_amount should be the SAME value (they're synonyms)
-
-5. CURRENCY:
-   - Detect from currency symbols or text:
-     * € = EUR (Euro - EU, some African countries)
-     * $ = USD (US Dollar - US, Canada, Australia, etc. - check context)
-     * £ = GBP (British Pound - UK)
-     * ¥ = JPY (Japanese Yen) or CNY (Chinese Yuan - check context)
-     * ₹ = INR (Indian Rupee)
-     * CHF = Swiss Franc
-     * CAD = Canadian Dollar (if $ with Canadian context)
-     * AUD = Australian Dollar (if $ with Australian context)
-   - Look for currency codes in text: "EUR", "USD", "GBP", etc.
-   - If not found, infer from country context or use null
-
-6. ITEMS:
-   - Extract line items if clearly listed
-   - Each item: name, quantity (if shown), price per unit, total
-   - If items show tax/VAT rates, note it but don't include in item object
-   - If items are not clearly separated, use empty array []
-
-7. PAYMENT_METHOD:
-   - Look for payment terms in various languages:
-     * English: "Cash", "Credit Card", "Debit Card", "Card"
-     * Dutch: "Contant", "PIN", "iDEAL"
-     * German: "Bar", "Karte", "EC-Karte"
-     * French: "Espèces", "Carte", "CB"
-     * Spanish: "Efectivo", "Tarjeta"
-
-8. ADDRESS: Full store address if available
-
-9. PHONE: Phone number in any format
-
-10. VAT_PERCENTAGE:
-    - Common VAT rates by country:
-      * Netherlands: 9% (low), 21% (standard)
-      * UK: 0%, 5%, 20%
-      * Germany: 7% (reduced), 19% (standard)
-      * France: 5.5%, 10%, 20%
-      * US: varies by state (0-10% typically)
-      * Canada: 5% GST + provincial tax (varies)
-    
-    - Calculate based on whether total includes or excludes tax:
-      * If total INCLUDES tax: VAT% = (tax_amount / (total_amount - tax_amount)) * 100
-      * If total EXCLUDES tax: VAT% = (tax_amount / subtotal) * 100
-    
-    - Example (total includes tax): total=10.00, tax=1.74 → VAT% = (1.74 / (10.00 - 1.74)) * 100 = 21.07%
-    - Example (total excludes tax): subtotal=8.26, tax=1.74 → VAT% = (1.74 / 8.26) * 100 = 21.07%
-    
-    - If receipt shows multiple tax rates, calculate effective/weighted rate
-    - If calculation is unclear, use the most common rate shown or null
-
-HANDLING OCR ERRORS:
-- If text is unclear or garbled, use null for that field
-- Try to infer from context (e.g., "AH" likely means "Albert Heijn")
-- Numbers with OCR errors: if clearly a number but some digits are wrong, use your best interpretation
-
-EXAMPLE OUTPUT:
-{{
-  "merchant_name": "Albert Heijn",
-  "date": "2022-07-15",
-  "total_amount": 9.72,
-  "tax_amount": 1.68,
-  "subtotal": 8.04,
-  "currency": "EUR",
-  "items": [{{"name": "Brood", "quantity": 1, "price": 2.50, "total": 2.50}}, {{"name": "Melk", "quantity": 2, "price": 1.25, "total": 2.50}}],
-  "payment_method": "PIN",
-  "address": "Hoofdstraat 123, Amsterdam",
-  "phone": null,
-  "vat_amount": 1.68,
-  "vat_percentage": 21.0
-}}
-
-NOW EXTRACT DATA FROM THIS RECEIPT TEXT:
+OCR TEXT:
 
 {ocr_text}
 
@@ -288,7 +186,12 @@ Return ONLY the JSON object (no markdown, no code blocks, no explanations):"""
             raise ValueError(f"Could not parse JSON from LLM response. Last error: {json_parse_errors[-1] if json_parse_errors else 'Unknown'}")
         
         # Validate and clean extracted data
-        return validate_extracted_fields(extracted_data)
+        raw = validate_extracted_fields(extracted_data)
+        
+        # Reconcile VAT and items, compute effective VAT percentage
+        validated = reconcile_vat_and_items(raw, ocr_text)
+        
+        return validated
         
     except requests.exceptions.ConnectionError as e:
         error_msg = f"Cannot connect to Ollama at {settings.OLLAMA_BASE_URL}. Is Ollama running?"
@@ -308,6 +211,226 @@ Return ONLY the JSON object (no markdown, no code blocks, no explanations):"""
         raise Exception(error_msg)
 
 
+def parse_vat_lines(ocr_text: str) -> List[Dict[str, Any]]:
+    """
+    Extract VAT lines from OCR text using regex patterns as fallback.
+    
+    Args:
+        ocr_text: Raw OCR text from receipt
+        
+    Returns:
+        List of VAT breakdown entries with vat_rate and tax_amount
+    """
+    patterns = [
+        r"(VAT|BTW|TVA|IVA|MwSt)\s*(\d{1,2}(?:[.,]\d)?)%\s*([0-9.,]+)",
+        r"(\d{1,2}(?:[.,]\d)?)%\s*([0-9.,]+)",
+        r"(VAT|BTW|TVA|IVA|MwSt)\s*(\d{1,2}(?:[.,]\d)?)%",
+    ]
+    results = []
+    
+    for pat in patterns:
+        for m in re.finditer(pat, ocr_text, flags=re.IGNORECASE):
+            try:
+                if len(m.groups()) >= 2:
+                    # Pattern 1: VAT 21% 1.68 or Pattern 2: 21% 1.68
+                    if len(m.groups()) == 3:
+                        rate_str = m.group(2)
+                        amount_str = m.group(3)
+                    elif len(m.groups()) == 2:
+                        # Could be rate then amount, or just rate
+                        if '%' in m.group(1):
+                            rate_str = m.group(1).replace('%', '')
+                            amount_str = m.group(2) if len(m.groups()) > 1 else None
+                        else:
+                            rate_str = m.group(1)
+                            amount_str = m.group(2)
+                    else:
+                        continue
+                    
+                    rate = float(rate_str.replace(',', '.'))
+                    if amount_str:
+                        amount = float(amount_str.replace(',', '.').replace(' ', ''))
+                        results.append({"vat_rate": round(rate, 1), "tax_amount": round(amount, 2)})
+                    else:
+                        results.append({"vat_rate": round(rate, 1), "tax_amount": None})
+            except (ValueError, IndexError):
+                continue
+    
+    # Collapse duplicates by rate
+    combined = {}
+    for r in results:
+        rate = r["vat_rate"]
+        if rate not in combined:
+            combined[rate] = {"vat_rate": rate, "tax_amount": 0.0}
+        if r["tax_amount"] is not None:
+            combined[rate]["tax_amount"] += r["tax_amount"]
+    
+    return [{"vat_rate": rate, "tax_amount": round(t["tax_amount"], 2) if t["tax_amount"] > 0 else None} 
+            for rate, t in sorted(combined.items())]
+
+
+def reconcile_vat_and_items(extracted: Dict[str, Any], ocr_text: str = "") -> Dict[str, Any]:
+    """
+    Reconcile VAT breakdown, compute base amounts, and calculate weighted effective VAT percentage.
+    
+    Args:
+        extracted: Raw extracted data from LLM
+        ocr_text: Original OCR text for fallback VAT parsing
+        
+    Returns:
+        Validated and reconciled data with vat_breakdown and vat_percentage_effective
+    """
+    validated = extracted.copy()
+    warnings = []
+    
+    # Ensure items list exists
+    if "items" not in validated or not isinstance(validated["items"], list):
+        validated["items"] = []
+    
+    # Clean items: ensure proper structure
+    cleaned_items = []
+    for item in validated["items"]:
+        if isinstance(item, dict):
+            cleaned_item = {
+                "name": str(item.get("name", "")).strip() if item.get("name") else None,
+                "quantity": round(float(item["quantity"]), 2) if item.get("quantity") is not None else None,
+                "unit_price": round(float(item["unit_price"]), 2) if item.get("unit_price") is not None else None,
+                "line_total": round(float(item.get("line_total", item.get("total", 0))), 2) if item.get("line_total") is not None or item.get("total") is not None else None,
+                "vat_rate": round(float(item["vat_rate"]), 1) if item.get("vat_rate") is not None else None
+            }
+            cleaned_items.append(cleaned_item)
+    validated["items"] = cleaned_items
+    
+    # Extract or build VAT breakdown
+    vat_breakdown = []
+    
+    # First, try to use LLM-provided vat_breakdown
+    if "vat_breakdown" in validated and isinstance(validated["vat_breakdown"], list):
+        for entry in validated["vat_breakdown"]:
+            if isinstance(entry, dict) and "vat_rate" in entry:
+                vat_breakdown.append({
+                    "vat_rate": round(float(entry["vat_rate"]), 1),
+                    "tax_amount": round(float(entry["tax_amount"]), 2) if entry.get("tax_amount") is not None else None,
+                    "base_amount": round(float(entry["base_amount"]), 2) if entry.get("base_amount") is not None else None
+                })
+    
+    # If no vat_breakdown from LLM, try regex fallback
+    if not vat_breakdown and ocr_text:
+        regex_vat = parse_vat_lines(ocr_text)
+        if regex_vat:
+            vat_breakdown = regex_vat
+            warnings.append("VAT breakdown extracted via regex fallback")
+    
+    # If still no breakdown, try to infer from items
+    if not vat_breakdown and validated["items"]:
+        item_rates = {}
+        for item in validated["items"]:
+            if item.get("vat_rate") is not None:
+                rate = round(float(item["vat_rate"]), 1)
+                if rate not in item_rates:
+                    item_rates[rate] = {"vat_rate": rate, "tax_amount": 0.0, "base_amount": 0.0}
+                
+                # Calculate tax and base for this item
+                line_total = item.get("line_total") or item.get("total") or 0.0
+                if line_total > 0:
+                    # Assume tax-included (EU style)
+                    base = line_total / (1 + rate / 100)
+                    tax = line_total - base
+                    item_rates[rate]["tax_amount"] += tax
+                    item_rates[rate]["base_amount"] += base
+        
+        if item_rates:
+            vat_breakdown = [
+                {
+                    "vat_rate": rate,
+                    "tax_amount": round(t["tax_amount"], 2),
+                    "base_amount": round(t["base_amount"], 2)
+                }
+                for rate, t in sorted(item_rates.items())
+            ]
+            warnings.append("VAT breakdown inferred from items")
+    
+    # If still no breakdown but we have tax_amount, create single entry
+    if not vat_breakdown and validated.get("tax_amount") is not None:
+        tax_amount = float(validated["tax_amount"])
+        total_amount = validated.get("total_amount")
+        subtotal = validated.get("subtotal")
+        
+        # Try to infer rate
+        if total_amount and total_amount > tax_amount:
+            # Assume tax-included
+            base = total_amount - tax_amount
+            if base > 0:
+                inferred_rate = (tax_amount / base) * 100
+                vat_breakdown = [{
+                    "vat_rate": round(inferred_rate, 1),
+                    "tax_amount": round(tax_amount, 2),
+                    "base_amount": round(base, 2)
+                }]
+        elif subtotal and subtotal > 0:
+            # Assume tax-excluded
+            inferred_rate = (tax_amount / subtotal) * 100
+            vat_breakdown = [{
+                "vat_rate": round(inferred_rate, 1),
+                "tax_amount": round(tax_amount, 2),
+                "base_amount": round(subtotal, 2)
+            }]
+    
+    # Compute base_amount for entries that don't have it
+    for entry in vat_breakdown:
+        if entry.get("base_amount") is None and entry.get("tax_amount") is not None and entry.get("vat_rate") is not None:
+            rate = entry["vat_rate"]
+            tax = entry["tax_amount"]
+            # Calculate base from tax: base = tax / (rate / 100)
+            if rate > 0:
+                base = tax / (rate / 100)
+                entry["base_amount"] = round(base, 2)
+    
+    # Compute tax_amount for entries that don't have it
+    for entry in vat_breakdown:
+        if entry.get("tax_amount") is None and entry.get("base_amount") is not None and entry.get("vat_rate") is not None:
+            rate = entry["vat_rate"]
+            base = entry["base_amount"]
+            tax = base * (rate / 100)
+            entry["tax_amount"] = round(tax, 2)
+    
+    validated["vat_breakdown"] = vat_breakdown
+    
+    # Calculate weighted effective VAT percentage
+    vat_percentage_effective = None
+    if vat_breakdown:
+        total_base = sum(e.get("base_amount", 0) or 0 for e in vat_breakdown)
+        total_tax = sum(e.get("tax_amount", 0) or 0 for e in vat_breakdown)
+        
+        if total_base > 0:
+            vat_percentage_effective = round((total_tax / total_base) * 100, 1)
+        elif total_tax > 0 and validated.get("total_amount"):
+            # Fallback: use total_amount
+            total = float(validated["total_amount"])
+            if total > total_tax:
+                base = total - total_tax
+                if base > 0:
+                    vat_percentage_effective = round((total_tax / base) * 100, 1)
+    
+    validated["vat_percentage_effective"] = vat_percentage_effective
+    
+    # Round all amounts to 2 decimals
+    for field in ["total_amount", "tax_amount", "subtotal"]:
+        if validated.get(field) is not None:
+            validated[field] = round(float(validated[field]), 2)
+    
+    # Round VAT rates in breakdown to 1 decimal
+    for entry in validated["vat_breakdown"]:
+        if entry.get("vat_rate") is not None:
+            entry["vat_rate"] = round(float(entry["vat_rate"]), 1)
+    
+    # Store warnings if any
+    if warnings:
+        validated["_warnings"] = warnings
+    
+    return validated
+
+
 def validate_extracted_fields(data: Dict[str, Any]) -> Dict[str, Any]:
     """
     Validate and clean extracted fields.
@@ -324,7 +447,9 @@ def validate_extracted_fields(data: Dict[str, Any]) -> Dict[str, Any]:
         "total_amount": None,
         "tax_amount": None,
         "subtotal": None,
+        "currency": None,
         "items": [],
+        "vat_breakdown": [],
         "payment_method": None,
         "address": None,
         "phone": None,
@@ -346,6 +471,10 @@ def validate_extracted_fields(data: Dict[str, Any]) -> Dict[str, Any]:
             except (ValueError, TypeError):
                 validated[field] = None
     
+    # Extract currency
+    if "currency" in data:
+        validated["currency"] = str(data["currency"]).strip().upper() if data["currency"] else None
+    
     # Extract items
     if "items" in data and isinstance(data["items"], list):
         validated["items"] = []
@@ -353,9 +482,21 @@ def validate_extracted_fields(data: Dict[str, Any]) -> Dict[str, Any]:
             if isinstance(item, dict):
                 validated["items"].append({
                     "name": str(item.get("name", "")).strip() if item.get("name") else None,
-                    "quantity": float(item["quantity"]) if item.get("quantity") else None,
-                    "price": float(item["price"]) if item.get("price") else None,
-                    "total": float(item["total"]) if item.get("total") else None,
+                    "quantity": float(item["quantity"]) if item.get("quantity") is not None else None,
+                    "unit_price": float(item.get("unit_price", item.get("price", 0))) if item.get("unit_price") is not None or item.get("price") is not None else None,
+                    "line_total": float(item.get("line_total", item.get("total", 0))) if item.get("line_total") is not None or item.get("total") is not None else None,
+                    "vat_rate": float(item["vat_rate"]) if item.get("vat_rate") is not None else None,
+                })
+    
+    # Extract vat_breakdown
+    if "vat_breakdown" in data and isinstance(data["vat_breakdown"], list):
+        validated["vat_breakdown"] = []
+        for entry in data["vat_breakdown"]:
+            if isinstance(entry, dict) and "vat_rate" in entry:
+                validated["vat_breakdown"].append({
+                    "vat_rate": float(entry["vat_rate"]),
+                    "tax_amount": float(entry["tax_amount"]) if entry.get("tax_amount") is not None else None,
+                    "base_amount": float(entry["base_amount"]) if entry.get("base_amount") is not None else None,
                 })
     
     # Extract optional fields
