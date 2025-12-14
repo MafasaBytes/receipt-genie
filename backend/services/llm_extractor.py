@@ -95,7 +95,7 @@ Return ONLY the JSON object (no markdown, no code blocks, no explanations):"""
                 "prompt": prompt,
                 "stream": False,
                 "options": {
-                    "temperature": 0.1,  # Low temperature for structured extraction
+                    "temperature": 0.1,  # Low temperature 
                 }
             },
             timeout=settings.OLLAMA_TIMEOUT
