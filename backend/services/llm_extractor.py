@@ -5,10 +5,121 @@ import json
 import re
 import requests
 import logging
+from functools import lru_cache
+from pathlib import Path
 from typing import Dict, Any, Optional, List
+
+import yaml
+
 from config import settings
 
 logger = logging.getLogger(__name__)
+
+PROMPT_CONFIG_PATH = (
+    Path(__file__).resolve().parent.parent / "prompts" / "receipt_extraction.yml"
+)
+
+
+@lru_cache(maxsize=1)
+def load_receipt_prompt_config() -> Dict[str, Any]:
+    """Load YAML prompt configuration for receipt extraction."""
+    try:
+        with open(PROMPT_CONFIG_PATH, "r", encoding="utf-8") as f:
+            data = yaml.safe_load(f) or {}
+            if not isinstance(data, dict):
+                logger.warning(
+                    "Receipt prompt config is not a mapping. Using empty config instead."
+                )
+                return {}
+            return data
+    except FileNotFoundError:
+        logger.warning(
+            f"Receipt prompt config not found at {PROMPT_CONFIG_PATH}. "
+            "Falling back to built-in prompt."
+        )
+        return {}
+    except Exception as e:
+        logger.error(f"Error loading receipt prompt config: {e}")
+        return {}
+
+
+def build_llm_prompt(ocr_text: str) -> str:
+    """Build the LLM prompt from YAML config with safe fallbacks."""
+    config = load_receipt_prompt_config() or {}
+    prompt_cfg = config.get("prompt", {})
+
+    # Fallbacks preserve existing behavior if YAML is missing or partially defined.
+    system = prompt_cfg.get(
+        "system",
+        "You are a receipt data extraction expert. Extract structured data from the receipt OCR text below.",
+    )
+    rules = prompt_cfg.get(
+        "rules",
+        "CRITICAL RULES:\n"
+        "- Output ONLY valid JSON. No explanations. No markdown.\n"
+        "- Use null for missing values.\n"
+        "- Numbers must be floats (e.g., 9.72).\n"
+        "- VAT should always be expressed as a percentage (e.g., 21.0, 9.0, 10.0).\n"
+        "- If multiple VAT rates appear, list them ALL in vat_breakdown.\n",
+    )
+    output_schema = prompt_cfg.get(
+        "output_schema",
+        "{\n"
+        '  "merchant_name": "string or null",\n'
+        '  "date": "string or null",\n'
+        '  "currency": "string or null",\n'
+        "  \"total_amount\": float or null,\n"
+        "  \"tax_amount\": float or null,\n"
+        "  \"subtotal\": float or null,\n"
+        "\n"
+        "  \"items\": [\n"
+        "    {\n"
+        '      "name": "string or null",\n'
+        "      \"quantity\": float or null,\n"
+        "      \"unit_price\": float or null,\n"
+        "      \"line_total\": float or null,\n"
+        "      \"vat_rate\": float or null\n"
+        "    }\n"
+        "  ],\n"
+        "\n"
+        "  \"vat_breakdown\": [\n"
+        "    {\n"
+        "      \"vat_rate\": float,\n"
+        "      \"tax_amount\": float or null,\n"
+        "      \"base_amount\": float or null\n"
+        "    }\n"
+        "  ],\n"
+        "\n"
+        '  "payment_method": "string or null",\n'
+        '  "address": "string or null",\n'
+        '  "phone": "string or null"\n'
+        "}\n",
+    )
+    extraction_guidelines = prompt_cfg.get(
+        "extraction_guidelines",
+        "Extraction guidelines:\n"
+        "- If multiple VAT lines appear (e.g., 21% and 9%), include both in vat_breakdown.\n"
+        "- If item lines include VAT, include the vat_rate per item.\n"
+        "- If receipt totals are tax-included, compute base amounts using base = total / (1 + rate).\n"
+        "- If receipt totals are tax-excluded, compute tax = base * rate.\n"
+        "- If only one VAT rate is visible, still return a single vat_breakdown entry.\n",
+    )
+    output_instructions = prompt_cfg.get(
+        "output_instructions",
+        "Return ONLY the JSON object (no markdown, no code blocks, no explanations):",
+    )
+
+    prompt_parts = [
+        system.strip(),
+        rules.strip(),
+        output_schema.strip(),
+        extraction_guidelines.strip(),
+        "OCR TEXT:",
+        ocr_text.strip(),
+        output_instructions.strip(),
+    ]
+
+    return "\n\n".join(prompt_parts)
 
 
 def extract_fields_llm(ocr_text: str) -> Dict[str, Any]:
@@ -21,59 +132,7 @@ def extract_fields_llm(ocr_text: str) -> Dict[str, Any]:
     Returns:
         Dictionary with extracted fields
     """
-    prompt = f"""You are a receipt data extraction expert. Extract structured data from the receipt OCR text below.
-
-CRITICAL RULES:
-- Output ONLY valid JSON. No explanations. No markdown.
-- Use null for missing values.
-- Numbers must be floats (e.g., 9.72).
-- VAT should always be expressed as a percentage (e.g., 21.0, 9.0, 10.0).
-- If multiple VAT rates appear, list them ALL in vat_breakdown.
-
-JSON SCHEMA TO RETURN:
-{{
-  "merchant_name": "string or null",
-  "date": "string or null",
-  "currency": "string or null",
-  "total_amount": float or null,
-  "tax_amount": float or null,
-  "subtotal": float or null,
-
-  "items": [
-    {{
-      "name": "string or null",
-      "quantity": float or null,
-      "unit_price": float or null,
-      "line_total": float or null,
-      "vat_rate": float or null
-    }}
-  ],
-
-  "vat_breakdown": [
-    {{
-      "vat_rate": float,
-      "tax_amount": float or null,
-      "base_amount": float or null
-    }}
-  ],
-
-  "payment_method": "string or null",
-  "address": "string or null",
-  "phone": "string or null"
-}}
-
-Extraction guidelines:
-- If multiple VAT lines appear (e.g., 21% and 9%), include both in vat_breakdown.
-- If item lines include VAT, include the vat_rate per item.
-- If receipt totals are tax-included, compute base amounts using base = total / (1 + rate).
-- If receipt totals are tax-excluded, compute tax = base * rate.
-- If only one VAT rate is visible, still return a single vat_breakdown entry.
-
-OCR TEXT:
-
-{ocr_text}
-
-Return ONLY the JSON object (no markdown, no code blocks, no explanations):"""
+    prompt = build_llm_prompt(ocr_text)
 
     try:
         # Check if model exists, use fallback if not
@@ -87,6 +146,11 @@ Return ONLY the JSON object (no markdown, no code blocks, no explanations):"""
         logger.info(f"Calling Ollama API with model: {model_to_use}")
         logger.debug(f"OCR text length: {len(ocr_text)} characters")
         
+        # Allow basic model options (e.g. temperature) to be configured via YAML.
+        prompt_config = load_receipt_prompt_config() or {}
+        model_cfg = prompt_config.get("model", {}) if isinstance(prompt_config, dict) else {}
+        temperature = model_cfg.get("temperature", 0.1)
+
         # Call Ollama API
         response = requests.post(
             f"{settings.OLLAMA_BASE_URL}/api/generate",
@@ -95,7 +159,7 @@ Return ONLY the JSON object (no markdown, no code blocks, no explanations):"""
                 "prompt": prompt,
                 "stream": False,
                 "options": {
-                    "temperature": 0.1,  # Low temperature 
+                    "temperature": float(temperature) if temperature is not None else 0.1,  # Low temperature 
                 }
             },
             timeout=settings.OLLAMA_TIMEOUT
@@ -112,7 +176,6 @@ Return ONLY the JSON object (no markdown, no code blocks, no explanations):"""
         logger.debug(f"LLM response length: {len(response_text)} characters")
         
         # Try to extract JSON from response
-        # Sometimes LLM adds markdown code blocks
         if "```json" in response_text:
             response_text = response_text.split("```json")[1].split("```")[0].strip()
         elif "```" in response_text:

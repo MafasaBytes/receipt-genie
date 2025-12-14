@@ -95,7 +95,7 @@ def detect_receipts(image_path: Path) -> List[str]:
                 # Additional filtering (very relaxed criteria for faint receipts)
                 if area_ratio < 0.002:  # 0.2% minimum area (very relaxed)
                     reason = f"area ratio too small ({area_ratio*100:.2f}% < 0.2%)"
-                    logger.warning(f"  REJECTED: {reason}")
+                    logger.warning(f" REJECTED: {reason}")
                     rejected_regions.append({"contour": idx + 1, "reason": reason, "area_ratio": area_ratio})
                     continue
                 
@@ -133,7 +133,7 @@ def detect_receipts(image_path: Path) -> List[str]:
                             if slice_img.size > 0:
                                 crop_path = save_crop(slice_img, crops_dir, f"{image_path.stem}_region_{idx}_slice_{slice_idx}")
                                 cropped_paths.append(crop_path)
-                                logger.info(f"  ✓ Saved slice {slice_idx + 1}/{len(slices)}: {Path(crop_path).name}")
+                                logger.info(f" Saved slice {slice_idx + 1}/{len(slices)}: {Path(crop_path).name}")
                             else:
                                 logger.warning(f"  REJECTED slice {slice_idx + 1}: empty slice")
                     else:
@@ -141,12 +141,12 @@ def detect_receipts(image_path: Path) -> List[str]:
                         logger.info(f"  Slicing found only 1 region, treating as single receipt")
                         crop_path = save_crop(region, crops_dir, f"{image_path.stem}_region_{idx}")
                         cropped_paths.append(crop_path)
-                        logger.info(f"  ✓ Saved receipt: {Path(crop_path).name}")
+                        logger.info(f" Saved receipt: {Path(crop_path).name}")
                 else:
                     # Single receipt in this region (either not tall enough or covers most of page)
                     crop_path = save_crop(region, crops_dir, f"{image_path.stem}_region_{idx}")
                     cropped_paths.append(crop_path)
-                    logger.info(f"  ✓ Saved receipt: {Path(crop_path).name}")
+                    logger.info(f" Saved receipt: {Path(crop_path).name}")
                     
             except Exception as e:
                 reason = f"processing error: {str(e)}"
@@ -366,7 +366,7 @@ def extract_contours(image: np.ndarray) -> List[np.ndarray]:
     min_height_ratio = 0.01   # 1% of image height
     min_width_ratio = 0.03    # 3% of image width
     min_aspect_ratio = 0.3    # Very permissive aspect ratio
-    min_area_ratio = 0.001    # 0.1% of image area (very relaxed)
+    min_area_ratio = 0.0001    # 0.1% of image area (very relaxed)
     
     for idx, contour in enumerate(contours):
             x, y, cw, ch = cv2.boundingRect(contour)

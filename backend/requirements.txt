@@ -31,6 +31,7 @@ numpy==1.26.4
 
 # LLM
 requests==2.32.3
+PyYAML==6.0.2
 
 # Data export
 pandas==2.2.3
