@@ -22,9 +22,10 @@ export interface Receipt {
   vat_percentage_effective: number | null;
   vat_breakdown: VATBreakdownEntry[] | null;
   items: ReceiptItem[] | null;
+  description: string | null;
   currency: string | null;
-  confidence_score?: number | null; // Accuracy/confidence score (0-1)
-  modified?: boolean; // Frontend flag for edited receipts
+  confidence_score?: number | null;
+  modified?: boolean;
 }
 
 export interface ProcessingStats {

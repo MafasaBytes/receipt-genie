@@ -42,6 +42,7 @@ export function ReceiptsTable({ receipts }: ReceiptsTableProps) {
         <TableHeader>
           <TableRow className="bg-muted/50 hover:bg-muted/50">
             <TableHead className="font-semibold">Store Name</TableHead>
+            <TableHead className="font-semibold">Description</TableHead>
             <TableHead className="font-semibold">Date</TableHead>
             <TableHead className="font-semibold">Total</TableHead>
             <TableHead className="font-semibold">VAT</TableHead>
@@ -61,6 +62,9 @@ export function ReceiptsTable({ receipts }: ReceiptsTableProps) {
             >
               <TableCell className="font-medium">
                 {receipt.store_name || "—"}
+              </TableCell>
+              <TableCell className="max-w-xs text-sm text-muted-foreground" title={receipt.description ?? undefined}>
+                <span className="block truncate">{receipt.description || "—"}</span>
               </TableCell>
               <TableCell className="text-muted-foreground">
                 {formatDate(receipt.date)}

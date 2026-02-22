@@ -114,12 +114,17 @@ def build_llm_prompt(ocr_text: str, rag_examples_block: str = "") -> str:
         "Return ONLY the JSON object (no markdown, no code blocks, no explanations):",
     )
 
+    item_extraction = prompt_cfg.get("item_extraction", "")
+
     prompt_parts = [
         system.strip(),
         rules.strip(),
         output_schema.strip(),
         extraction_guidelines.strip(),
     ]
+
+    if item_extraction and item_extraction.strip():
+        prompt_parts.append(item_extraction.strip())
 
     # Inject RAG few-shot examples when available
     if rag_examples_block and rag_examples_block.strip():

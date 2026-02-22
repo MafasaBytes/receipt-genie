@@ -73,6 +73,19 @@ prompt:
     - If REFERENCE EXAMPLES are provided above, use them as style and format guidance
       but extract data ONLY from the OCR TEXT below. Do NOT copy values from examples.
 
+  item_extraction: |
+    ITEM EXTRACTION (CRITICAL — do not skip):
+    - Extract EVERY individual line item / product / service from the receipt. One item per entry.
+    - Each item MUST have at least "name" and "line_total". Set others to null if unknown.
+    - If a line reads "2x Coffee 4.50", extract as: name="Coffee", quantity=2, unit_price=2.25, line_total=4.50.
+    - Netherlands VAT rates:
+        21% = standard (electronics, clothing, services, non-food goods)
+         9% = reduced  (food, drinks, medicine, books, newspapers, hotels, restaurants)
+         0% = exempt   (education, healthcare, certain financial services)
+    - Assign the correct vat_rate to each item based on its category.
+    - If the receipt uses VAT indicator codes (e.g., "A"=high, "B"=low, or "*"/"#"), map them to the numeric rate.
+    - Do NOT merge multiple products into a single item. Each distinct product line is a separate entry.
+
   output_instructions: |
     Use the OCR text below to populate the JSON schema.
     Think carefully but respond concisely.

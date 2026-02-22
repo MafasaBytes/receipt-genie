@@ -304,6 +304,7 @@ export function EditableReceiptTable({ receipts, onReceiptUpdate }: EditableRece
         <TableHeader>
           <TableRow className="bg-muted/50 hover:bg-muted/50">
             <TableHead className="font-semibold">Store Name</TableHead>
+            <TableHead className="font-semibold">Description</TableHead>
             <TableHead className="font-semibold">Date</TableHead>
             <TableHead className="font-semibold">Total</TableHead>
             <TableHead className="font-semibold">VAT</TableHead>
@@ -328,6 +329,9 @@ export function EditableReceiptTable({ receipts, onReceiptUpdate }: EditableRece
                 {receipt.modified && (
                   <span className="ml-2 text-xs text-blue-600 dark:text-blue-400">modified</span>
                 )}
+              </TableCell>
+              <TableCell className="max-w-xs text-sm text-muted-foreground" title={receipt.description ?? undefined}>
+                <span className="block truncate">{receipt.description || "—"}</span>
               </TableCell>
               <TableCell className="text-muted-foreground">
                 {renderEditableCell(receipt.id, 'date', formatDate(receipt.date), 'date')}

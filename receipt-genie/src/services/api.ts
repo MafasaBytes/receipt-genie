@@ -196,6 +196,20 @@ function mapBackendReceiptsToFrontend(backendReceipts: any[]): Receipt[] {
       vatPercentage = receipt.vat_percentage;
     }
     
+    const items: Array<{name: string | null; quantity: number | null; unit_price: number | null; line_total: number | null; vat_rate: number | null}> = receipt.items || [];
+    let description: string | null = null;
+    const itemDescriptions = items
+      .filter((item) => item.name)
+      .map((item) => {
+        let parts = item.name!;
+        if (item.vat_rate != null) parts += ` (${item.vat_rate}%)`;
+        if (item.line_total != null) parts += ` ${item.line_total.toFixed(2)}`;
+        return parts;
+      });
+    if (itemDescriptions.length > 0) {
+      description = itemDescriptions.join(', ');
+    }
+
     return {
       id: receipt.id?.toString() || receipt.receipt_number?.toString() || '',
       store_name: receipt.merchant_name || null,
@@ -206,7 +220,8 @@ function mapBackendReceiptsToFrontend(backendReceipts: any[]): Receipt[] {
       vat_percentage_effective: receipt.vat_percentage_effective || null,
       vat_breakdown: receipt.vat_breakdown || null,
       items: receipt.items || null,
-      currency: receipt.currency || "EUR", // Default to EUR if not detected (safety fallback)
+      description,
+      currency: receipt.currency || "EUR",
       confidence_score: receipt.confidence_score || null
     };
   });
