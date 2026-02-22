@@ -73,12 +73,10 @@ export function ReceiptScanner() {
           setStatus(prev => ({
             ...prev,
             progress,
-            message: progress < 30 
-              ? 'Converting PDF to images...'
+            message: progress < 20 
+              ? 'Extracting text from PDF...'
               : progress < 50 
-                ? 'Detecting receipts on pages...'
-                : progress < 70 
-                  ? 'Running OCR on detected receipts...'
+                ? 'Processing pages...'
                 : progress < 90 
                   ? 'Extracting fields with AI...'
                   : 'Finalizing and normalizing data...'

@@ -38,3 +38,29 @@ test/**
 .test/**/*.pyz
 .test/**/*.pywz
 .test/**/*.pyz
+
+# Backend temp 
+backend/temp/*
+backend/temp/**
+.backend/temp/*
+.backend/temp/**
+.backend/temp/**/*.pyc
+.backend/temp/**/*.pyo
+.backend/temp/**/*.pyd
+.backend/temp/**/*.pyw
+.backend/temp/**/*.pyz
+.backend/temp/**/*.pywz
+.backend/temp/**/*.pyz
+
+# Backend docs
+backend/docs/*
+backend/docs/**
+.backend/docs/*
+.backend/docs/**
+.backend/docs/**/*.pyc
+.backend/docs/**/*.pyo
+.backend/docs/**/*.pyd
+.backend/docs/**/*.pyw
+.backend/docs/**/*.pyz
+.backend/docs/**/*.pywz
+.backend/docs/**/*.pyz

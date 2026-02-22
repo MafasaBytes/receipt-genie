@@ -44,37 +44,40 @@ def process_pdf_background(
     """Background task for processing PDF."""
     try:
         update_job_status(job_id, "processing", 0)
-        
+
         def progress_callback(progress: int, message: str):
             update_job_status(job_id, "processing", progress)
-            import logging
-            logger = logging.getLogger(__name__)
             logger.info(f"[{job_id}] {progress}%: {message}")
-        
-        # Run pipeline - now returns enhanced response with stats
+
         result = process_pdf_pipeline(file_id, db, progress_callback)
-        
-        import logging
-        logger = logging.getLogger(__name__)
-        
-        # Handle both old format (list) and new format (dict with stats)
+
         if isinstance(result, dict):
             receipts = result.get("receipts", [])
-            logger.info(f"[{job_id}] Pipeline completed. Extracted {len(receipts)} receipt(s) from {result.get('receipts_detected', 0)} detected")
+            # Persist real pipeline stats so /receipts/{file_id} can use them
+            _job_status[job_id]["pipeline_stats"] = {
+                "pages_processed": result.get("pages_processed", 0),
+                "receipts_detected": result.get("receipts_detected", 0),
+                "receipts_extracted": result.get("receipts_extracted", 0),
+                "missing_receipts_estimate": result.get("missing_receipts_estimate", 0),
+                "page_stats": result.get("page_stats", []),
+                "detection_warning": result.get("detection_warning", False),
+            }
+            logger.info(
+                f"[{job_id}] Pipeline completed. "
+                f"{result.get('receipts_extracted', 0)} extracted from "
+                f"{result.get('pages_processed', 0)} page(s)"
+            )
         else:
-            # Legacy format - list of receipts
             receipts = result if result else []
-            logger.info(f"[{job_id}] Pipeline completed. Extracted {len(receipts)} receipt(s)")
-        
-        if not receipts or len(receipts) == 0:
-            logger.warning(f"[{job_id}] No receipts extracted! Check logs for details.")
+            logger.info(f"[{job_id}] Pipeline completed. {len(receipts)} receipt(s)")
+
+        if not receipts:
+            logger.warning(f"[{job_id}] No receipts extracted!")
             update_job_status(job_id, "completed", 100, "No receipts extracted - check logs")
         else:
             update_job_status(job_id, "completed", 100)
-        
+
     except Exception as e:
-        import logging
-        logger = logging.getLogger(__name__)
         logger.error(f"[{job_id}] Pipeline failed: {str(e)}")
         logger.exception("Full error traceback:")
         update_job_status(job_id, "failed", 0, str(e))
@@ -211,27 +214,56 @@ async def get_receipts(
             missing_fields=metadata.get("missing_fields")
         ))
     
-    # Calculate stats (simplified - in production, store these in database)
-    # For now, we'll estimate based on receipts found
+    # Look up real pipeline stats stored by the background task
+    pipeline_stats = None
+    for job_data in _job_status.values():
+        if job_data.get("file_id") == file_id and "pipeline_stats" in job_data:
+            pipeline_stats = job_data["pipeline_stats"]
+            break
+
     receipts_extracted = len(receipt_list)
-    # Estimate detected as extracted + some margin (in production, track this)
-    receipts_detected = max(receipts_extracted, receipts_extracted + 1)
-    
+
+    if pipeline_stats:
+        pages_processed = pipeline_stats["pages_processed"]
+        receipts_detected = pipeline_stats["receipts_detected"]
+        missing_estimate = pipeline_stats["missing_receipts_estimate"]
+        page_stats_raw = pipeline_stats["page_stats"]
+        detection_warning = pipeline_stats["detection_warning"]
+
+        page_stats = [
+            PageStat(
+                page_number=ps.get("page_number", i + 1),
+                detected=ps.get("detected", 0),
+                successful=ps.get("successful", 0),
+                rejected=ps.get("rejected", 0),
+                rejection_reasons=ps.get("rejection_reasons", []),
+            )
+            for i, ps in enumerate(page_stats_raw)
+        ]
+    else:
+        pages_processed = max(receipts_extracted, 1)
+        receipts_detected = receipts_extracted
+        missing_estimate = 0
+        detection_warning = receipts_extracted == 0
+        page_stats = [
+            PageStat(
+                page_number=1,
+                detected=receipts_extracted,
+                successful=receipts_extracted,
+                rejected=0,
+                rejection_reasons=[],
+            )
+        ]
+
     return EnhancedReceiptListResponse(
         file_id=file_id,
-        pages_processed=1,  # Would need to track this
+        pages_processed=pages_processed,
         receipts_detected=receipts_detected,
         receipts_extracted=receipts_extracted,
-        missing_receipts_estimate=max(0, receipts_detected - receipts_extracted),
-        page_stats=[PageStat(
-            page_number=1,
-            detected=receipts_detected,
-            successful=receipts_extracted,
-            rejected=max(0, receipts_detected - receipts_extracted),
-            rejection_reasons=[]
-        )],
-        detection_warning=receipts_detected == 0,
-        receipts=receipt_list
+        missing_receipts_estimate=missing_estimate,
+        page_stats=page_stats,
+        detection_warning=detection_warning,
+        receipts=receipt_list,
     )
 
 
@@ -423,43 +455,48 @@ async def get_file_stats(
     receipts = db.query(Receipt).filter(Receipt.file_id == file_id).all()
     
     receipts_extracted = len(receipts)
-    receipts_detected = max(receipts_extracted, receipts_extracted + 1)  # Estimate
-    
-    # Calculate average confidence
+
+    # Use real pipeline stats if available
+    pipeline_stats = None
+    for job_data in _job_status.values():
+        if job_data.get("file_id") == file_id and "pipeline_stats" in job_data:
+            pipeline_stats = job_data["pipeline_stats"]
+            break
+
+    if pipeline_stats:
+        receipts_detected = pipeline_stats["receipts_detected"]
+        pages_processed = pipeline_stats["pages_processed"]
+        missing_estimate = pipeline_stats["missing_receipts_estimate"]
+    else:
+        receipts_detected = receipts_extracted
+        pages_processed = max(receipts_extracted, 1)
+        missing_estimate = 0
+
     avg_confidence = 0.0
     if receipts:
         confidences = [r.confidence_score for r in receipts if r.confidence_score is not None]
         if confidences:
             avg_confidence = sum(confidences) / len(confidences)
-    
-    # Count fields with missing data
-    missing_fields_count = 0
-    for receipt in receipts:
-        if receipt.merchant_name is None:
-            missing_fields_count += 1
-        if receipt.date is None:
-            missing_fields_count += 1
-        if receipt.total_amount is None:
-            missing_fields_count += 1
-        if receipt.tax_amount is None:
-            missing_fields_count += 1
-        if receipt.currency is None:
-            missing_fields_count += 1
-    
+
     return {
         "file_id": file_id,
         "receipts_detected": receipts_detected,
         "receipts_extracted": receipts_extracted,
-        "missing_receipts_estimate": max(0, receipts_detected - receipts_extracted),
+        "missing_receipts_estimate": missing_estimate,
         "average_confidence": round(avg_confidence, 2),
-        "total_missing_fields": missing_fields_count,
-        "pages_processed": 1,  # Would need to track this
+        "total_missing_fields": sum(
+            (1 if r.merchant_name is None else 0)
+            + (1 if r.date is None else 0)
+            + (1 if r.total_amount is None else 0)
+            + (1 if r.tax_amount is None else 0)
+            for r in receipts
+        ),
+        "pages_processed": pages_processed,
         "error_breakdown": {
             "no_merchant_name": sum(1 for r in receipts if r.merchant_name is None),
             "no_date": sum(1 for r in receipts if r.date is None),
             "no_total": sum(1 for r in receipts if r.total_amount is None),
             "no_tax": sum(1 for r in receipts if r.tax_amount is None),
-            "no_currency": sum(1 for r in receipts if r.currency is None)
-        }
+        },
     }
 

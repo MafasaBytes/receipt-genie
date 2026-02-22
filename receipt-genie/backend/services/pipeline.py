@@ -1,23 +1,28 @@
 """
 End-to-end receipt processing pipeline.
+
+PDF path (primary):
+    PDF → langchain text extraction per page → LLM → DB
+    Falls back to image + OCR for scanned pages with no selectable text.
+
+Image path:
+    Image → OCR → LLM → DB   (no contour detection)
 """
 from pathlib import Path
 from typing import List, Dict, Any
 from sqlalchemy.orm import Session
-import uuid
 import json
 import logging
 import time
 
 from config import settings
+from services.pdf_text_extractor import extract_text_from_pdf_safe
 from services.pdf_utils import pdf_to_images
-from services.receipt_detector import detect_receipts, crop_receipt
 from services.ocr_engine import run_ocr
 from services.llm_extractor import extract_fields_llm, check_ollama_connection
 from services.rag_service import retrieve_examples, build_few_shot_block, cross_validate
 from services.vector_store import index_receipt
 from models.db_models import Receipt, UploadedFile
-from models.receipt import ReceiptCreate
 
 logger = logging.getLogger(__name__)
 
@@ -205,482 +210,418 @@ def process_pdf_pipeline(
     pipeline_start_time = time.time()
     
     try:
-        # Step 1: Convert PDF to images OR use image directly
-        if is_image_file(file_path):
-            # Image file: use directly, skip PDF conversion
+        all_receipts = []
+        page_stats = []
+        total_pages = 0
+
+        # ---------------------------------------------------------------
+        # PDF path: langchain text extraction (primary), OCR fallback
+        # ---------------------------------------------------------------
+        if is_pdf_file(file_path):
+            if progress_callback:
+                progress_callback(10, "Extracting text from PDF...")
+
+            logger.info(f"Extracting text from PDF: {file_path}")
+            step_start = time.time()
+
+            pages = extract_text_from_pdf_safe(file_path)
+
+            if pages:
+                total_pages = len(pages)
+                logger.info(f"Extracted text from {total_pages} page(s) in {time.time() - step_start:.2f}s")
+
+                for page in pages:
+                    page_num = page["page_number"]
+                    page_stat = {"page_number": page_num, "detected": 1, "successful": 0, "rejected": 0, "rejection_reasons": []}
+
+                    if progress_callback:
+                        base = 10 + int(((page_num - 1) / max(total_pages, 1)) * 30)
+                        progress_callback(base, f"Processing page {page_num}/{total_pages}...")
+
+                    logger.info("=" * 60)
+                    logger.info(f"PAGE {page_num}/{total_pages}")
+
+                    if page["has_text"]:
+                        ocr_text = page["text"]
+                        source_path = str(file_path)
+                        logger.info(f"  Text extracted via PDF loader ({len(ocr_text)} chars)")
+                    else:
+                        # Scanned page – fall back to image + OCR
+                        logger.info("  Insufficient selectable text, falling back to OCR")
+                        try:
+                            images_dir = settings.TEMP_DIR / f"{file_id}_images"
+                            images_dir.mkdir(exist_ok=True)
+                            image_paths = pdf_to_images(file_path, images_dir)
+                            if page_num - 1 < len(image_paths):
+                                img_path = image_paths[page_num - 1]
+                                ocr_text = run_ocr(img_path)
+                                source_path = str(img_path)
+                            else:
+                                raise ValueError(f"Image for page {page_num} not available")
+                        except Exception as ocr_err:
+                            logger.error(f"  OCR fallback failed: {ocr_err}")
+                            page_stat["rejected"] += 1
+                            page_stat["rejection_reasons"].append(f"OCR fallback error: {ocr_err}")
+                            page_stats.append(page_stat)
+                            continue
+
+                    if not ocr_text or len(ocr_text.strip()) < 10:
+                        logger.warning(f"  Skipping page {page_num}: insufficient text ({len(ocr_text) if ocr_text else 0} chars)")
+                        page_stat["rejected"] += 1
+                        page_stat["rejection_reasons"].append("Insufficient text")
+                        page_stats.append(page_stat)
+                        continue
+
+                    receipt_result = _extract_single_receipt(
+                        ocr_text=ocr_text,
+                        source_path=source_path,
+                        file_id=file_id,
+                        receipt_number=len(all_receipts) + 1,
+                        db=db,
+                        progress_callback=progress_callback,
+                        total_pages=total_pages,
+                        current_page=page_num,
+                    )
+
+                    if receipt_result:
+                        all_receipts.append(receipt_result)
+                        page_stat["successful"] += 1
+                    else:
+                        page_stat["rejected"] += 1
+                        page_stat["rejection_reasons"].append("LLM extraction failed")
+
+                    page_stats.append(page_stat)
+            else:
+                # langchain extraction failed entirely – fall back to OCR for all pages
+                logger.warning("langchain PDF extraction failed, falling back to full OCR pipeline")
+                images_dir = settings.TEMP_DIR / f"{file_id}_images"
+                images_dir.mkdir(exist_ok=True)
+                image_paths = pdf_to_images(file_path, images_dir)
+                total_pages = len(image_paths)
+                if not image_paths:
+                    raise ValueError("No pages extracted from PDF")
+
+                for page_idx, img_path in enumerate(image_paths):
+                    page_num = page_idx + 1
+                    page_stat = {"page_number": page_num, "detected": 1, "successful": 0, "rejected": 0, "rejection_reasons": []}
+
+                    if progress_callback:
+                        base = 10 + int((page_idx / max(total_pages, 1)) * 30)
+                        progress_callback(base, f"OCR page {page_num}/{total_pages}...")
+
+                    try:
+                        ocr_text = run_ocr(img_path)
+                    except Exception as ocr_err:
+                        logger.error(f"  OCR failed on page {page_num}: {ocr_err}")
+                        page_stat["rejected"] += 1
+                        page_stat["rejection_reasons"].append(f"OCR error: {ocr_err}")
+                        page_stats.append(page_stat)
+                        continue
+
+                    if not ocr_text or len(ocr_text.strip()) < 10:
+                        page_stat["rejected"] += 1
+                        page_stat["rejection_reasons"].append("Insufficient OCR text")
+                        page_stats.append(page_stat)
+                        continue
+
+                    receipt_result = _extract_single_receipt(
+                        ocr_text=ocr_text,
+                        source_path=str(img_path),
+                        file_id=file_id,
+                        receipt_number=len(all_receipts) + 1,
+                        db=db,
+                        progress_callback=progress_callback,
+                        total_pages=total_pages,
+                        current_page=page_num,
+                    )
+                    if receipt_result:
+                        all_receipts.append(receipt_result)
+                        page_stat["successful"] += 1
+                    else:
+                        page_stat["rejected"] += 1
+                        page_stat["rejection_reasons"].append("LLM extraction failed")
+
+                    page_stats.append(page_stat)
+
+        # ---------------------------------------------------------------
+        # Image path: OCR the full image (no contour detection)
+        # ---------------------------------------------------------------
+        elif is_image_file(file_path):
+            total_pages = 1
             if progress_callback:
                 progress_callback(10, "Processing image file...")
-            
-            logger.info(f"Processing image file directly: {file_path}")
-            image_paths = [file_path]
-            
-            # If needed, copy to temp directory for consistency
+
+            logger.info(f"Processing image file: {file_path}")
+            page_stat = {"page_number": 1, "detected": 1, "successful": 0, "rejected": 0, "rejection_reasons": []}
+
             images_dir = settings.TEMP_DIR / f"{file_id}_images"
             images_dir.mkdir(exist_ok=True)
+            import shutil
             temp_image_path = images_dir / f"{file_id}_page_1{file_path.suffix}"
             if not temp_image_path.exists():
-                import shutil
                 shutil.copy2(file_path, temp_image_path)
-                image_paths = [temp_image_path]
-                logger.debug(f"Copied image to temp directory: {temp_image_path}")
-            
-        elif is_pdf_file(file_path):
-            # PDF file: convert to images
-            if progress_callback:
-                progress_callback(10, "Converting PDF to images...")
-            
-            logger.info(f"Converting PDF to images: {file_path}")
-            step_start = time.time()
-            
-            images_dir = settings.TEMP_DIR / f"{file_id}_images"
-            images_dir.mkdir(exist_ok=True)
-            image_paths = pdf_to_images(file_path, images_dir)
-            
-            logger.info(f"Extracted {len(image_paths)} images in {time.time() - step_start:.2f}s")
-            
-            if not image_paths:
-                raise ValueError("No images extracted from PDF")
+
+            try:
+                ocr_text = run_ocr(temp_image_path)
+            except Exception as ocr_err:
+                logger.error(f"OCR failed: {ocr_err}")
+                page_stat["rejected"] += 1
+                page_stat["rejection_reasons"].append(f"OCR error: {ocr_err}")
+                page_stats.append(page_stat)
+                ocr_text = None
+
+            if ocr_text and len(ocr_text.strip()) >= 10:
+                receipt_result = _extract_single_receipt(
+                    ocr_text=ocr_text,
+                    source_path=str(temp_image_path),
+                    file_id=file_id,
+                    receipt_number=1,
+                    db=db,
+                    progress_callback=progress_callback,
+                    total_pages=1,
+                    current_page=1,
+                )
+                if receipt_result:
+                    all_receipts.append(receipt_result)
+                    page_stat["successful"] += 1
+                else:
+                    page_stat["rejected"] += 1
+                    page_stat["rejection_reasons"].append("LLM extraction failed")
+            elif ocr_text is not None:
+                page_stat["rejected"] += 1
+                page_stat["rejection_reasons"].append("Insufficient OCR text")
+
+            page_stats.append(page_stat)
         else:
             raise ValueError(f"Unsupported file type: {file_path.suffix}. Supported: PDF, PNG, JPG, JPEG, BMP, TIFF, WEBP")
-        
-        all_receipts = []
-        total_steps = len(image_paths)
-        total_receipts_processed = 0
-        estimated_total_receipts = total_steps * 2  # Estimate 2 receipts per page (will adjust dynamically)
-        
-        # Statistics tracking
-        page_stats = []  # List of dicts with page statistics
-        
-        # Process each page
-        for page_idx, image_path in enumerate(image_paths):
-            page_stat = {
-                "page_number": page_idx + 1,
-                "detected": 0,
-                "successful": 0,
-                "rejected": 0,
-                "rejection_reasons": []
-            }
-            if progress_callback:
-                # Base progress: 10% for PDF conversion, 70% for processing
-                # Distribute across pages
-                base_progress = 10 + int((page_idx / max(total_steps, 1)) * 30)
-                progress_callback(base_progress, f"Processing page {page_idx + 1}/{total_steps}...")
-            
-            # Step 2: Detect and extract receipts in image
-            logger.info(f"=" * 60)
-            logger.info(f"PAGE {page_idx + 1}/{total_steps}: Detecting receipts")
-            logger.info(f"  Source image: {image_path}")
-            detection_start = time.time()
-            try:
-                cropped_receipt_paths = detect_receipts(image_path)
-                detection_duration = time.time() - detection_start
-                page_stat["detected"] = len(cropped_receipt_paths)
-                logger.info(f"[OK] Detection completed in {detection_duration:.2f}s")
-                logger.info(f"  → Detected {len(cropped_receipt_paths)} receipt(s) on page {page_idx + 1}")
-                for i, path in enumerate(cropped_receipt_paths, 1):
-                    logger.info(f"    Receipt {i}: {path}")
-            except Exception as det_error:
-                logger.error(f"[FAILED] Receipt detection failed on page {page_idx + 1}: {str(det_error)}")
-                logger.exception("Detection error details:")
-                page_stat["rejected"] = 1
-                page_stat["rejection_reasons"].append(f"Detection error: {str(det_error)}")
-                page_stats.append(page_stat)
-                continue
-            
-            if not cropped_receipt_paths:
-                logger.warning(f"[WARNING] No receipts detected in page {page_idx + 1}, skipping")
-                page_stats.append(page_stat)
-                continue
-            
-            # Update estimated total if we found more receipts than expected
-            if len(cropped_receipt_paths) > 2:
-                estimated_total_receipts = max(estimated_total_receipts, total_receipts_processed + len(cropped_receipt_paths) + (total_steps - page_idx - 1) * 2)
-            
-            # Process each detected receipt
-            for receipt_idx, cropped_path_str in enumerate(cropped_receipt_paths):
-                receipt_success = False
-                receipt_rejection_reason = None
-                
-                try:
-                    # cropped_path is already a path to the cropped receipt image
-                    cropped_path = Path(cropped_path_str)
-                    
-                    # Verify cropped image exists
-                    if not cropped_path.exists():
-                        logger.warning(f"[WARNING] Cropped receipt image not found: {cropped_path}")
-                        logger.info(f"  Using original image path as fallback: {image_path}")
-                        if image_path.exists():
-                            cropped_path = image_path
-                        else:
-                            logger.error(f"[FAILED] Original image also not found: {image_path}, skipping receipt")
-                            receipt_rejection_reason = "Image file not found"
-                            page_stat["rejected"] += 1
-                            page_stat["rejection_reasons"].append(f"Receipt {receipt_idx + 1}: {receipt_rejection_reason}")
-                            continue
-                    
-                    logger.info(f"  Processing receipt {receipt_idx + 1}/{len(cropped_receipt_paths)} from page {page_idx + 1}")
-                    logger.info(f"    Image: {cropped_path.name}")
-                    
-                    # Step 3: Run OCR on cropped receipt
-                    ocr_start = time.time()
-                    try:
-                        ocr_text = run_ocr(cropped_path)
-                        ocr_duration = time.time() - ocr_start
-                        logger.info(f"[OK] OCR completed in {ocr_duration:.2f}s ({len(ocr_text) if ocr_text else 0} chars)")
-                    except Exception as ocr_error:
-                        logger.error(f"[FAILED] OCR failed: {str(ocr_error)}")
-                        logger.exception("OCR error details:")
-                        receipt_rejection_reason = f"OCR error: {str(ocr_error)}"
-                        page_stat["rejected"] += 1
-                        page_stat["rejection_reasons"].append(f"Receipt {receipt_idx + 1}: {receipt_rejection_reason}")
-                        continue
-                    
-                    if not ocr_text or len(ocr_text.strip()) < 10:
-                        logger.warning(f"[WARNING] Insufficient OCR text ({len(ocr_text) if ocr_text else 0} chars < 10), skipping receipt")
-                        logger.debug(f"    OCR text preview: {ocr_text[:100] if ocr_text else 'None'}")
-                        receipt_rejection_reason = f"Insufficient OCR text ({len(ocr_text) if ocr_text else 0} chars)"
-                        page_stat["rejected"] += 1
-                        page_stat["rejection_reasons"].append(f"Receipt {receipt_idx + 1}: {receipt_rejection_reason}")
-                        continue
-                    
-                    # Step 4a: RAG retrieval — find similar past receipts
-                    receipt_number = len(all_receipts) + 1
-                    total_receipts_processed += 1
 
-                    rag_examples_block = ""
-                    rag_matches = []
-                    try:
-                        if settings.RAG_ENABLED:
-                            rag_matches = retrieve_examples(ocr_text)
-                            if rag_matches:
-                                rag_examples_block = build_few_shot_block(rag_matches)
-                                logger.info(
-                                    f"    RAG: {len(rag_matches)} similar receipt(s) retrieved "
-                                    f"(best similarity: {rag_matches[0]['similarity']:.2f})"
-                                )
-                            else:
-                                logger.info("    RAG: no similar receipts found (cold start or low similarity)")
-                    except Exception as rag_err:
-                        logger.warning(f"    RAG retrieval failed (non-fatal): {rag_err}")
-
-                    # Step 4b: Extract fields with LLM (RAG-augmented)
-                    logger.info(f"    Extracting fields with LLM for receipt {receipt_number}...")
-
-                    # Update progress before LLM call (can be slow)
-                    if progress_callback:
-                        receipt_progress = 40 + int((total_receipts_processed / max(estimated_total_receipts, 1)) * 60)
-                        progress_callback(receipt_progress, f"Extracting data from receipt {receipt_number} ({total_receipts_processed}/{estimated_total_receipts})...")
-
-                    llm_start = time.time()
-                    llm_success = False
-                    try:
-                        extracted_fields = extract_fields_llm(ocr_text, rag_examples_block=rag_examples_block)
-                        llm_duration = time.time() - llm_start
-                        llm_success = True
-                        logger.info(f"[OK] LLM extraction completed in {llm_duration:.2f}s")
-                        if llm_duration > 60:
-                            logger.warning(f"[WARNING] LLM extraction took {llm_duration:.2f}s (slow)")
-                    except Exception as llm_error:
-                        llm_duration = time.time() - llm_start
-                        logger.error(f"[FAILED] LLM extraction failed after {llm_duration:.2f}s: {str(llm_error)}")
-                        logger.exception("LLM error details:")
-                        extracted_fields = {
-                            "merchant_name": None,
-                            "date": None,
-                            "total_amount": None,
-                            "tax_amount": None,
-                            "subtotal": None,
-                            "items": [],
-                            "payment_method": None,
-                            "address": None,
-                            "phone": None,
-                            "currency": None,
-                            "vat_amount": None,
-                            "vat_percentage": None,
-                        }
-                        logger.warning("[WARNING] Continuing with empty extracted fields due to LLM failure")
-
-                    # Step 4c: RAG cross-validation
-                    if rag_matches and llm_success:
-                        try:
-                            extracted_fields = cross_validate(extracted_fields, rag_matches)
-                            rag_warnings = extracted_fields.pop("_rag_warnings", [])
-                            if rag_warnings:
-                                for w in rag_warnings:
-                                    logger.info(f"    RAG validation: {w}")
-                        except Exception as cv_err:
-                            logger.warning(f"    RAG cross-validation failed (non-fatal): {cv_err}")
-                    
-                    # Post-process tax/VAT extraction (works for any country)
-                    # Ensure tax_amount and vat_amount are consistent (they're synonyms)
-                    if extracted_fields.get("vat_amount") is not None and extracted_fields.get("tax_amount") is None:
-                        extracted_fields["tax_amount"] = extracted_fields["vat_amount"]
-                    elif extracted_fields.get("tax_amount") is not None and extracted_fields.get("vat_amount") is None:
-                        extracted_fields["vat_amount"] = extracted_fields["tax_amount"]
-                    
-                    # Calculate/validate VAT percentage and amounts
-                    # Try both methods: total includes tax (EU style) and total excludes tax (US style)
-                    if extracted_fields.get("total_amount") and extracted_fields.get("tax_amount"):
-                        total = float(extracted_fields["total_amount"])
-                        tax = float(extracted_fields["tax_amount"])
-                        
-                        if total > tax > 0:
-                            # Method 1: Assume total INCLUDES tax (common in EU)
-                            # VAT% = (tax / (total - tax)) * 100
-                            calculated_vat_pct_inclusive = (tax / (total - tax)) * 100
-                            
-                            # Method 2: Assume total EXCLUDES tax (common in US)
-                            # VAT% = (tax / total) * 100
-                            calculated_vat_pct_exclusive = (tax / total) * 100
-                            
-                            # Use the method that gives a more reasonable VAT rate (typically 0-30%)
-                            # EU rates are usually 9-27%, US rates 0-10%
-                            if 5.0 <= calculated_vat_pct_inclusive <= 30.0:
-                                calculated_vat_pct = calculated_vat_pct_inclusive
-                                # Calculate subtotal if missing
-                                if extracted_fields.get("subtotal") is None:
-                                    extracted_fields["subtotal"] = round(total - tax, 2)
-                            elif 0.0 <= calculated_vat_pct_exclusive <= 15.0:
-                                calculated_vat_pct = calculated_vat_pct_exclusive
-                                # Calculate total if missing (shouldn't happen, but just in case)
-                                if extracted_fields.get("subtotal") is None:
-                                    extracted_fields["subtotal"] = round(total, 2)
-                            else:
-                                # Use inclusive method as default (more common globally)
-                                calculated_vat_pct = calculated_vat_pct_inclusive
-                                if extracted_fields.get("subtotal") is None:
-                                    extracted_fields["subtotal"] = round(total - tax, 2)
-                            
-                            # If LLM didn't provide vat_percentage, or it's way off, use calculated
-                            if extracted_fields.get("vat_percentage") is None:
-                                extracted_fields["vat_percentage"] = round(calculated_vat_pct, 1)  # Round to 1 decimal
-                            else:
-                                llm_vat_pct = float(extracted_fields["vat_percentage"])
-                                # If LLM value is more than 5% off, use calculated (more reliable)
-                                if abs(llm_vat_pct - calculated_vat_pct) > 5.0:
-                                    logger.debug(f"    Correcting VAT percentage: LLM={llm_vat_pct:.1f}%, calculated={calculated_vat_pct:.1f}% (using calculated)")
-                                    extracted_fields["vat_percentage"] = round(calculated_vat_pct, 1)  # Round to 1 decimal
-                    
-                    # Calculate/validate subtotal if still missing
-                    if extracted_fields.get("total_amount") and extracted_fields.get("tax_amount") and extracted_fields.get("subtotal") is None:
-                        total = float(extracted_fields["total_amount"])
-                        tax = float(extracted_fields["tax_amount"])
-                        # Default to EU style (total includes tax)
-                        extracted_fields["subtotal"] = round(total - tax, 2)
-                    
-                    # Calculate confidence score based on extraction quality
-                    confidence_score = calculate_confidence_score(extracted_fields, llm_success, ocr_text)
-                    logger.debug(f"    Calculated confidence score: {confidence_score:.2%} (LLM success: {llm_success}, fields extracted: {sum(1 for k in ['merchant_name', 'date', 'total_amount', 'tax_amount', 'currency'] if extracted_fields.get(k) is not None)}/5)")
-                    
-                    # Normalize and clean extracted fields
-                    extracted_fields = normalize_extracted_fields(extracted_fields)
-                    
-                    # Add missing field metadata if confidence is high
-                    missing_metadata = add_missing_field_metadata(extracted_fields, confidence_score)
-                    
-                    # Step 5: Save to database
-                    
-                    # Convert items to JSON string for storage
-                    # Also store currency and vat_percentage in metadata
-                    items_json = None
-                    if extracted_fields.get("items"):
-                        items_data = extracted_fields["items"]
-                        if isinstance(items_data, list):
-                            items_json = json.dumps(items_data)
-                        else:
-                            items_json = json.dumps(items_data)
-                    else:
-                        # Create empty items structure with metadata
-                        items_json = json.dumps([])
-                    
-                    # Add metadata to items JSON (currency, vat_percentage_effective, missing_fields)
-                    items_data = json.loads(items_json) if items_json else []
-                    if isinstance(items_data, list):
-                        metadata_obj = {
-                            "_metadata": {
-                                "currency": extracted_fields.get("currency"),
-                                "vat_percentage": extracted_fields.get("vat_percentage_effective"),  # Use effective VAT
-                                "missing_fields": missing_metadata
-                            }
-                        }
-                        # Store metadata separately - we'll extract it in response
-                        items_json = json.dumps({"items": items_data, "_metadata": metadata_obj["_metadata"]})
-                    
-                    # Extract VAT breakdown for database storage
-                    vat_breakdown_json = None
-                    if extracted_fields.get("vat_breakdown"):
-                        vat_breakdown_json = extracted_fields["vat_breakdown"]
-                    
-                    receipt_data = ReceiptCreate(
-                        file_id=file_id,
-                        receipt_number=receipt_number,
-                        merchant_name=extracted_fields.get("merchant_name"),
-                        date=extracted_fields.get("date"),
-                        total_amount=extracted_fields.get("total_amount"),
-                        tax_amount=extracted_fields.get("tax_amount"),
-                        subtotal=extracted_fields.get("subtotal"),
-                        items=None,  # Will be stored as JSON string
-                        payment_method=extracted_fields.get("payment_method"),
-                        address=extracted_fields.get("address"),
-                        phone=extracted_fields.get("phone"),
-                        raw_text=ocr_text,
-                        image_path=str(cropped_path),
-                        confidence_score=confidence_score
-                    )
-                    
-                    # Create database record
-                    db_receipt = Receipt(
-                        file_id=receipt_data.file_id,
-                        receipt_number=receipt_data.receipt_number,
-                        merchant_name=receipt_data.merchant_name,
-                        date=receipt_data.date,
-                        total_amount=receipt_data.total_amount,
-                        tax_amount=receipt_data.tax_amount,
-                        subtotal=receipt_data.subtotal,
-                        items=items_json,
-                        vat_breakdown=vat_breakdown_json,
-                        vat_percentage_effective=extracted_fields.get("vat_percentage_effective"),
-                        payment_method=receipt_data.payment_method,
-                        address=receipt_data.address,
-                        phone=receipt_data.phone,
-                        raw_text=receipt_data.raw_text,
-                        image_path=receipt_data.image_path,
-                        confidence_score=receipt_data.confidence_score
-                    )
-                    
-                    db.add(db_receipt)
-                    db.commit()
-                    db.refresh(db_receipt)
-                    
-                    # Extract metadata from items JSON
-                    items_data = json.loads(db_receipt.items) if db_receipt.items else {}
-                    if isinstance(items_data, dict):
-                        items_list = items_data.get("items", [])
-                        metadata = items_data.get("_metadata", {})
-                    else:
-                        items_list = items_data if isinstance(items_data, list) else []
-                        metadata = {}
-                    
-                    # Convert to response format
-                    receipt_dict = {
-                        "id": db_receipt.id,
-                        "file_id": db_receipt.file_id,
-                        "receipt_number": db_receipt.receipt_number,
-                        "merchant_name": db_receipt.merchant_name,
-                        "date": db_receipt.date,
-                        "total_amount": db_receipt.total_amount,
-                        "tax_amount": db_receipt.tax_amount,
-                        "subtotal": db_receipt.subtotal,
-                        "items": items_list,
-                        "vat_breakdown": db_receipt.vat_breakdown if db_receipt.vat_breakdown else [],
-                        "vat_percentage_effective": db_receipt.vat_percentage_effective,
-                        "payment_method": db_receipt.payment_method,
-                        "address": db_receipt.address,
-                        "phone": db_receipt.phone,
-                        "raw_text": db_receipt.raw_text,
-                        "image_path": db_receipt.image_path,
-                        "confidence_score": db_receipt.confidence_score,
-                        "extraction_date": db_receipt.extraction_date,
-                        "currency": metadata.get("currency") or extracted_fields.get("currency"),
-                        "vat_percentage": db_receipt.vat_percentage_effective,  # Use effective VAT
-                        "missing_fields": metadata.get("missing_fields") or missing_metadata
-                    }
-                    
-                    all_receipts.append(receipt_dict)
-
-                    # Step 6: Index in vector store for future RAG retrieval
-                    if settings.RAG_ENABLED and llm_success:
-                        try:
-                            index_receipt(
-                                receipt_id=db_receipt.id,
-                                ocr_text=ocr_text,
-                                extracted_fields=extracted_fields,
-                                is_user_corrected=False,
-                            )
-                            logger.debug(f"    Indexed receipt {db_receipt.id} in vector store")
-                        except Exception as idx_err:
-                            logger.warning(f"    Vector store indexing failed (non-fatal): {idx_err}")
-
-                    # Mark as successful
-                    receipt_success = True
-                    page_stat["successful"] += 1
-                    logger.info(f" [OK] Receipt {receipt_idx + 1} successfully processed and saved (ID: {db_receipt.id})")
-                    
-                except Exception as e:
-                    logger.error(f" [ERROR] Error processing receipt {receipt_idx + 1} from page {page_idx + 1}: {str(e)}")
-                    logger.exception("Full error traceback:")
-                    receipt_rejection_reason = f"Processing error: {str(e)}"
-                    page_stat["rejected"] += 1
-                    page_stat["rejection_reasons"].append(f"Receipt {receipt_idx + 1}: {receipt_rejection_reason}")
-                    continue
-            
-            # Log page summary
-            logger.info(f"  PAGE {page_idx + 1} SUMMARY: {page_stat['detected']} detected, {page_stat['successful']} successful, {page_stat['rejected']} rejected")
-            if page_stat["rejection_reasons"]:
-                for reason in page_stat["rejection_reasons"]:
-                    logger.warning(f"    - {reason}")
-            page_stats.append(page_stat)
-        
-        # Update file status
+        # ---------------------------------------------------------------
+        # Wrap-up
+        # ---------------------------------------------------------------
         uploaded_file.status = "completed"
         db.commit()
-        
+
         pipeline_duration = time.time() - pipeline_start_time
-        
-        # Final summary
+
+        total_detected = sum(s["detected"] for s in page_stats)
+        total_successful = sum(s["successful"] for s in page_stats)
+        total_rejected = sum(s["rejected"] for s in page_stats)
+
         logger.info("=" * 60)
         logger.info("PIPELINE PROCESSING SUMMARY")
-        logger.info("=" * 60)
-        total_detected = sum(stat["detected"] for stat in page_stats)
-        total_successful = sum(stat["successful"] for stat in page_stats)
-        total_rejected = sum(stat["rejected"] for stat in page_stats)
-        
-        logger.info(f"Total pages processed: {len(image_paths)}")
-        logger.info(f"Total receipts detected: {total_detected}")
-        logger.info(f"Total receipts successful: {total_successful}")
-        logger.info(f"Total receipts rejected: {total_rejected}")
-        logger.info(f"Pipeline duration: {pipeline_duration:.2f}s")
-        logger.info("")
-        
-        # Per-page breakdown
-        logger.info("Per-page breakdown:")
+        logger.info(f"  Pages: {total_pages} | Detected: {total_detected} | OK: {total_successful} | Rejected: {total_rejected}")
+        logger.info(f"  Duration: {pipeline_duration:.2f}s")
         for stat in page_stats:
-            logger.info(f"  Page {stat['page_number']}: {stat['detected']} detected, {stat['successful']} successful, {stat['rejected']} rejected")
-            if stat["rejection_reasons"]:
-                for reason in stat["rejection_reasons"]:
-                    logger.warning(f"    - {reason}")
-        
+            logger.info(f"  Page {stat['page_number']}: {stat['successful']} OK, {stat['rejected']} rejected")
+            for r in stat.get("rejection_reasons", []):
+                logger.warning(f"    - {r}")
         logger.info("=" * 60)
-        logger.info(f"[OK] Pipeline completed. Extracted {len(all_receipts)} receipt(s) saved to database")
-        logger.info("=" * 60)
-        
+
         if progress_callback:
-            progress_callback(100, f"Processing completed! Extracted {len(all_receipts)} receipt(s)")
-        
-        # Calculate detection warning
-        detection_warning = False
-        if total_detected == 0:
-            detection_warning = True
-        elif len(image_paths) > 1:
-            # Check if more than 1 page has 0 detections
-            pages_with_zero = sum(1 for stat in page_stats if stat["detected"] == 0)
-            if pages_with_zero > 1:
-                detection_warning = True
-        
-        # Return enhanced response with stats
+            progress_callback(100, f"Completed! Extracted {len(all_receipts)} receipt(s)")
+
         return {
             "receipts": all_receipts,
             "file_id": file_id,
-            "pages_processed": len(image_paths),
+            "pages_processed": total_pages,
             "receipts_detected": total_detected,
             "receipts_extracted": total_successful,
             "missing_receipts_estimate": total_detected - total_successful,
             "page_stats": page_stats,
-            "detection_warning": detection_warning
+            "detection_warning": total_detected == 0,
         }
-        
+
     except Exception as e:
-        # Update file status to failed
         uploaded_file.status = "failed"
         db.commit()
         raise Exception(f"Pipeline error: {str(e)}")
+
+
+def _extract_single_receipt(
+    ocr_text: str,
+    source_path: str,
+    file_id: str,
+    receipt_number: int,
+    db: Session,
+    progress_callback=None,
+    total_pages: int = 1,
+    current_page: int = 1,
+) -> Dict[str, Any] | None:
+    """
+    Run RAG retrieval → LLM extraction → post-processing → DB save for a
+    single receipt text.  Returns the receipt dict or None on failure.
+    """
+    # RAG retrieval
+    rag_examples_block = ""
+    rag_matches = []
+    try:
+        if settings.RAG_ENABLED:
+            rag_matches = retrieve_examples(ocr_text)
+            if rag_matches:
+                rag_examples_block = build_few_shot_block(rag_matches)
+                logger.info(
+                    f"  RAG: {len(rag_matches)} similar receipt(s) "
+                    f"(best sim={rag_matches[0]['similarity']:.2f})"
+                )
+            else:
+                logger.info("  RAG: no similar receipts found")
+    except Exception as rag_err:
+        logger.warning(f"  RAG retrieval failed (non-fatal): {rag_err}")
+
+    # LLM extraction
+    if progress_callback:
+        pct = 40 + int((current_page / max(total_pages, 1)) * 50)
+        progress_callback(pct, f"Extracting receipt {receipt_number}...")
+
+    llm_start = time.time()
+    llm_success = False
+    try:
+        extracted_fields = extract_fields_llm(ocr_text, rag_examples_block=rag_examples_block)
+        llm_success = True
+        logger.info(f"  LLM extraction OK in {time.time() - llm_start:.2f}s")
+    except Exception as llm_error:
+        logger.error(f"  LLM extraction failed after {time.time() - llm_start:.2f}s: {llm_error}")
+        extracted_fields = {
+            "merchant_name": None, "date": None, "total_amount": None,
+            "tax_amount": None, "subtotal": None, "items": [],
+            "payment_method": None, "address": None, "phone": None,
+            "currency": None, "vat_amount": None, "vat_percentage": None,
+        }
+
+    # RAG cross-validation
+    if rag_matches and llm_success:
+        try:
+            extracted_fields = cross_validate(extracted_fields, rag_matches)
+            for w in extracted_fields.pop("_rag_warnings", []):
+                logger.info(f"  RAG validation: {w}")
+        except Exception as cv_err:
+            logger.warning(f"  RAG cross-validation failed (non-fatal): {cv_err}")
+
+    # VAT/tax consistency
+    if extracted_fields.get("vat_amount") is not None and extracted_fields.get("tax_amount") is None:
+        extracted_fields["tax_amount"] = extracted_fields["vat_amount"]
+    elif extracted_fields.get("tax_amount") is not None and extracted_fields.get("vat_amount") is None:
+        extracted_fields["vat_amount"] = extracted_fields["tax_amount"]
+
+    _compute_vat(extracted_fields)
+
+    if extracted_fields.get("total_amount") and extracted_fields.get("tax_amount") and extracted_fields.get("subtotal") is None:
+        total = float(extracted_fields["total_amount"])
+        tax = float(extracted_fields["tax_amount"])
+        extracted_fields["subtotal"] = round(total - tax, 2)
+
+    confidence_score = calculate_confidence_score(extracted_fields, llm_success, ocr_text)
+    extracted_fields = normalize_extracted_fields(extracted_fields)
+    missing_metadata = add_missing_field_metadata(extracted_fields, confidence_score)
+
+    # Build items JSON with metadata
+    items_list = extracted_fields.get("items") or []
+    if not isinstance(items_list, list):
+        items_list = []
+    items_json = json.dumps({
+        "items": items_list,
+        "_metadata": {
+            "currency": extracted_fields.get("currency"),
+            "vat_percentage": extracted_fields.get("vat_percentage_effective"),
+            "missing_fields": missing_metadata,
+        },
+    })
+
+    vat_breakdown_json = extracted_fields.get("vat_breakdown") or None
+
+    db_receipt = Receipt(
+        file_id=file_id,
+        receipt_number=receipt_number,
+        merchant_name=extracted_fields.get("merchant_name"),
+        date=extracted_fields.get("date"),
+        total_amount=extracted_fields.get("total_amount"),
+        tax_amount=extracted_fields.get("tax_amount"),
+        subtotal=extracted_fields.get("subtotal"),
+        items=items_json,
+        vat_breakdown=vat_breakdown_json,
+        vat_percentage_effective=extracted_fields.get("vat_percentage_effective"),
+        payment_method=extracted_fields.get("payment_method"),
+        address=extracted_fields.get("address"),
+        phone=extracted_fields.get("phone"),
+        raw_text=ocr_text,
+        image_path=source_path,
+        confidence_score=confidence_score,
+    )
+    db.add(db_receipt)
+    db.commit()
+    db.refresh(db_receipt)
+
+    # Vector-store indexing
+    if settings.RAG_ENABLED and llm_success:
+        try:
+            index_receipt(
+                receipt_id=db_receipt.id,
+                ocr_text=ocr_text,
+                extracted_fields=extracted_fields,
+                is_user_corrected=False,
+            )
+        except Exception as idx_err:
+            logger.warning(f"  Vector store indexing failed (non-fatal): {idx_err}")
+
+    logger.info(f"  Receipt {receipt_number} saved (ID: {db_receipt.id}, confidence: {confidence_score:.0%})")
+
+    stored = json.loads(db_receipt.items) if db_receipt.items else {}
+    meta = stored.get("_metadata", {}) if isinstance(stored, dict) else {}
+    items_out = stored.get("items", []) if isinstance(stored, dict) else (stored if isinstance(stored, list) else [])
+
+    return {
+        "id": db_receipt.id,
+        "file_id": db_receipt.file_id,
+        "receipt_number": db_receipt.receipt_number,
+        "merchant_name": db_receipt.merchant_name,
+        "date": db_receipt.date,
+        "total_amount": db_receipt.total_amount,
+        "tax_amount": db_receipt.tax_amount,
+        "subtotal": db_receipt.subtotal,
+        "items": items_out,
+        "vat_breakdown": db_receipt.vat_breakdown or [],
+        "vat_percentage_effective": db_receipt.vat_percentage_effective,
+        "payment_method": db_receipt.payment_method,
+        "address": db_receipt.address,
+        "phone": db_receipt.phone,
+        "raw_text": db_receipt.raw_text,
+        "image_path": db_receipt.image_path,
+        "confidence_score": db_receipt.confidence_score,
+        "extraction_date": db_receipt.extraction_date,
+        "currency": meta.get("currency") or extracted_fields.get("currency"),
+        "vat_percentage": db_receipt.vat_percentage_effective,
+        "missing_fields": meta.get("missing_fields") or missing_metadata,
+    }
+
+
+def _compute_vat(extracted_fields: Dict[str, Any]) -> None:
+    """Compute/validate VAT percentage from total and tax amounts in-place."""
+    if not (extracted_fields.get("total_amount") and extracted_fields.get("tax_amount")):
+        return
+    total = float(extracted_fields["total_amount"])
+    tax = float(extracted_fields["tax_amount"])
+    if not (total > tax > 0):
+        return
+
+    inclusive = (tax / (total - tax)) * 100
+    exclusive = (tax / total) * 100
+
+    if 5.0 <= inclusive <= 30.0:
+        calc = inclusive
+        if extracted_fields.get("subtotal") is None:
+            extracted_fields["subtotal"] = round(total - tax, 2)
+    elif 0.0 <= exclusive <= 15.0:
+        calc = exclusive
+        if extracted_fields.get("subtotal") is None:
+            extracted_fields["subtotal"] = round(total, 2)
+    else:
+        calc = inclusive
+        if extracted_fields.get("subtotal") is None:
+            extracted_fields["subtotal"] = round(total - tax, 2)
+
+    if extracted_fields.get("vat_percentage") is None:
+        extracted_fields["vat_percentage"] = round(calc, 1)
+    else:
+        llm_val = float(extracted_fields["vat_percentage"])
+        if abs(llm_val - calc) > 5.0:
+            extracted_fields["vat_percentage"] = round(calc, 1)

@@ -136,9 +136,7 @@ def cross_validate(
     return extracted
 
 
-# ---------------------------------------------------------------------------
 # Helpers
-# ---------------------------------------------------------------------------
 
 def _collect_field(matches: List[Dict[str, Any]], field: str) -> List[str]:
     """Pull a string metadata field from retrieved matches."""

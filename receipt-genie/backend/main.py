@@ -1,6 +1,9 @@
 """
 FastAPI main application.
 """
+import os
+os.environ["ANONYMIZED_TELEMETRY"] = "False"
+
 import sys
 from pathlib import Path
 import logging
@@ -10,6 +13,7 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
 )
+logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)
 
 # Add backend directory to Python path
 backend_dir = Path(__file__).parent
@@ -133,6 +137,7 @@ if __name__ == "__main__":
         "main:app",
         host="0.0.0.0",
         port=8000,
-        reload=True
+        reload=True,
+        reload_dirs=[str(backend_dir)],
     )
 

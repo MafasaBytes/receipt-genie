@@ -168,15 +168,16 @@ def extract_fields_llm(ocr_text: str, rag_examples_block: str = "") -> Dict[str,
         model_cfg = prompt_config.get("model", {}) if isinstance(prompt_config, dict) else {}
         temperature = model_cfg.get("temperature", 0.1)
 
-        # Call Ollama API
+        # Call Ollama API with format:"json" to constrain output to valid JSON
         response = requests.post(
             f"{settings.OLLAMA_BASE_URL}/api/generate",
             json={
                 "model": model_to_use,
                 "prompt": prompt,
                 "stream": False,
+                "format": "json",
                 "options": {
-                    "temperature": float(temperature) if temperature is not None else 0.1,  # Low temperature 
+                    "temperature": float(temperature) if temperature is not None else 0.1,
                 }
             },
             timeout=settings.OLLAMA_TIMEOUT
@@ -259,6 +260,24 @@ def extract_fields_llm(ocr_text: str, rag_examples_block: str = "") -> Dict[str,
             except (json.JSONDecodeError, Exception) as e:
                 json_parse_errors.append(f"Line-by-line parse: {str(e)}")
         
+        # Strategy 5: Auto-close unclosed braces/brackets (handles truncated LLM output)
+        if extracted_data is None:
+            try:
+                start_idx = response_text.find("{")
+                if start_idx >= 0:
+                    fragment = response_text[start_idx:]
+                    fragment = re.sub(r',\s*}', '}', fragment)
+                    fragment = re.sub(r',\s*]', ']', fragment)
+                    fragment = re.sub(r'\bnull\.\d+\b', 'null', fragment)
+                    open_braces = fragment.count('{') - fragment.count('}')
+                    open_brackets = fragment.count('[') - fragment.count(']')
+                    fragment = fragment.rstrip().rstrip(',')
+                    fragment += ']' * max(0, open_brackets)
+                    fragment += '}' * max(0, open_braces)
+                    extracted_data = json.loads(fragment)
+            except (json.JSONDecodeError, Exception) as e:
+                json_parse_errors.append(f"Auto-close parse: {str(e)}")
+
         if extracted_data is None:
             error_details = "; ".join(json_parse_errors)
             logger.error(f"All JSON parsing strategies failed. Errors: {error_details}")
@@ -702,12 +721,21 @@ def check_ollama_connection() -> bool:
             logger.info(f"Ollama is running. Available models: {', '.join(model_names)}")
             if settings.OLLAMA_MODEL not in model_names:
                 logger.warning(f"Model '{settings.OLLAMA_MODEL}' not found. Available: {', '.join(model_names)}")
-                if model_names:
-                    # Auto-select first available model as fallback
-                    fallback_model = model_names[0]
+                # Filter out embedding-only models that can't do text generation
+                EMBEDDING_ONLY_PREFIXES = ("nomic-embed", "mxbai-embed", "all-minilm", "snowflake-arctic-embed", "bge-")
+                generative_models = [
+                    n for n in model_names
+                    if not any(n.lower().startswith(p) for p in EMBEDDING_ONLY_PREFIXES)
+                ]
+                if generative_models:
+                    fallback_model = generative_models[0]
                     logger.info(f"Using fallback model: {fallback_model}")
-                    # Update settings for this session
                     settings.OLLAMA_MODEL = fallback_model
+                elif model_names:
+                    logger.warning(
+                        "No generative models found — only embedding models are installed. "
+                        "Pull a generative model with: ollama pull llama3.2"
+                    )
             return True
         return False
     except requests.exceptions.ConnectionError:
