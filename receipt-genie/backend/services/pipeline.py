@@ -96,7 +96,6 @@ def normalize_extracted_fields(extracted_fields: Dict[str, Any]) -> Dict[str, An
     
     return normalized
 
-
 def add_missing_field_metadata(extracted_fields: Dict[str, Any], confidence_score: float) -> Dict[str, Any]:
     """
     Add metadata for missing fields when confidence is high (>0.90).
@@ -114,7 +113,6 @@ def add_missing_field_metadata(extracted_fields: Dict[str, Any], confidence_scor
                 }
     
     return metadata
-
 
 def calculate_confidence_score(extracted_fields: Dict[str, Any], llm_success: bool, ocr_text: str) -> float:
     """
@@ -159,17 +157,14 @@ def calculate_confidence_score(extracted_fields: Dict[str, Any], llm_success: bo
     # Ensure score is between 0.0 and 1.0
     return max(0.0, min(1.0, score))
 
-
 def is_image_file(file_path: Path) -> bool:
     """Check if file is an image based on extension."""
     image_extensions = [".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp"]
     return any(str(file_path).lower().endswith(ext) for ext in image_extensions)
 
-
 def is_pdf_file(file_path: Path) -> bool:
     """Check if file is a PDF based on extension."""
     return str(file_path).lower().endswith(".pdf")
-
 
 def process_pdf_pipeline(
     file_id: str,
@@ -265,7 +260,7 @@ def process_pdf_pipeline(
                             
                             ocr_text = run_ocr(crop_path)
                             source_path = str(crop_path)
-                            
+
                         except Exception as ocr_err:
                             logger.error(f"  OCR fallback failed: {ocr_err}")
                             page_stat["rejected"] += 1
@@ -444,7 +439,6 @@ def process_pdf_pipeline(
         db.commit()
         raise Exception(f"Pipeline error: {str(e)}")
 
-
 def _extract_single_receipt(
     ocr_text: str,
     source_path: str,
@@ -600,7 +594,6 @@ def _extract_single_receipt(
         "vat_percentage": db_receipt.vat_percentage_effective,
         "missing_fields": meta.get("missing_fields") or missing_metadata,
     }
-
 
 def _compute_vat(extracted_fields: Dict[str, Any]) -> None:
     """Compute/validate VAT percentage from total and tax amounts in-place."""
