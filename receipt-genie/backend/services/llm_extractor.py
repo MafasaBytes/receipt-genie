@@ -505,7 +505,7 @@ def reconcile_vat_and_items(extracted: Dict[str, Any], ocr_text: str = "") -> Di
     # - 9%  : low rate
     # - 10% : some special cases / canteens
     # - 21% : standard rate
-    common_vat_rates = [0.0, 9.0, 10.0, 21.0]
+    common_vat_rates = [9.0, 21.0]
 
     total_amount = validated.get("total_amount")
 

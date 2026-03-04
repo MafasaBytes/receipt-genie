@@ -16,6 +16,7 @@ import logging
 import time
 
 from config import settings
+from services.receipt_detector import detect_receipts
 from services.pdf_text_extractor import extract_text_from_pdf_safe
 from services.pdf_utils import pdf_to_images
 from services.ocr_engine import run_ocr
@@ -62,14 +63,14 @@ def normalize_extracted_fields(extracted_fields: Dict[str, Any]) -> Dict[str, An
                 normalized["vat_percentage"] = round(inferred_vat_pct, 1)
     
     # Normalize currency: only allow valid 3-letter codes
-    valid_currencies = {"EUR", "USD", "GBP", "CAD", "AUD", "JPY", "CNY", "INR", "CHF"}
+    valid_currencies = {"EUR", "USD"}
     if normalized.get("currency"):
         currency = str(normalized["currency"]).strip().upper()
         if currency in valid_currencies:
             normalized["currency"] = currency
         else:
             # Try to map common symbols
-            currency_map = {"€": "EUR", "$": "USD", "£": "GBP", "¥": "JPY", "₹": "INR"}
+            currency_map = {"€": "EUR", "$": "USD"}
             if currency in currency_map:
                 normalized["currency"] = currency_map[currency]
             else:
@@ -254,10 +255,17 @@ def process_pdf_pipeline(
                             image_paths = pdf_to_images(file_path, images_dir)
                             if page_num - 1 < len(image_paths):
                                 img_path = image_paths[page_num - 1]
-                                ocr_text = run_ocr(img_path)
-                                source_path = str(img_path)
-                            else:
-                                raise ValueError(f"Image for page {page_num} not available")
+                                # Run contour-based receipt detection and crop
+                                cropped_paths = detect_receipts(img_path)
+                                if cropped_paths:
+                                    crop_path = Path(cropped_paths[0])
+                                    logger.info(f"  Receipt detected and cropped: {crop_path.name}")
+                                else:
+                                   crop_path = Path(img_path)
+                            
+                            ocr_text = run_ocr(crop_path)
+                            source_path = str(crop_path)
+                            
                         except Exception as ocr_err:
                             logger.error(f"  OCR fallback failed: {ocr_err}")
                             page_stat["rejected"] += 1

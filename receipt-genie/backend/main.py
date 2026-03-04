@@ -57,8 +57,8 @@ async def lifespan(app: FastAPI):
         logger.info("[OK] Ollama is running and accessible")
     else:
         logger.warning("[WARNING] Ollama is not available. LLM extraction will fail.")
-        logger.warning("  Start Ollama with: ollama serve")
-        logger.warning("  Pull a model with: ollama pull llama3.2")
+        logger.warning(" Start Ollama with: ollama serve")
+        logger.warning(" Pull a generative model with: ollama pull llama3.2")
     
     # Check OCR availability
     from services.ocr_engine import is_ocr_available
