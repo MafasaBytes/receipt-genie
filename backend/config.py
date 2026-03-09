@@ -37,9 +37,10 @@ class Settings(BaseSettings):
     MAX_FILE_SIZE_MB: int = 50
     SUPPORTED_IMAGE_FORMATS: list = [".png", ".jpg", ".jpeg"]
     
-    # YOLO Settings (placeholder)
-    YOLO_MODEL_PATH: Optional[str] = None
-    YOLO_CONFIDENCE_THRESHOLD: float = 0.5
+    # Receipt Detection Mode
+    # Single-receipt-per-page: skip contour detection, OCR the full page image directly.
+    # Set to False to re-enable legacy multi-receipt contour detection.
+    SINGLE_RECEIPT_PER_PAGE: bool = True
     
     # OCR Settings
     OCR_LANG: str = "en"  # For PaddleOCR: "en", "ch", "fr", "german", "korean", "japan", etc.
