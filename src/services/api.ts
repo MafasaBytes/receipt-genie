@@ -196,7 +196,17 @@ function mapBackendReceiptsToFrontend(backendReceipts: any[]): Receipt[] {
       vatPercentage = receipt.vat_percentage;
     }
     
-    const items: Array<{name: string | null; quantity: number | null; unit_price: number | null; line_total: number | null; vat_rate: number | null}> = receipt.items || [];
+    const rawItems: Array<any> = receipt.items || [];
+    const items = rawItems.map((item: any) => ({
+      name: item.name || null,
+      quantity: item.quantity ?? null,
+      unit_price: item.unit_price ?? null,
+      line_total: item.line_total ?? null,
+      vat_rate: item.vat_rate ?? null,
+      vat_amount: item.vat_amount ?? null,
+    }));
+
+    // Build a short description from items for any context that still needs it
     let description: string | null = null;
     const itemDescriptions = items
       .filter((item) => item.name)

@@ -462,16 +462,25 @@ def reconcile_vat_and_items(extracted: Dict[str, Any], ocr_text: str = "") -> Di
     if "items" not in validated or not isinstance(validated["items"], list):
         validated["items"] = []
     
-    # Clean items: ensure proper structure
+    # Clean items: ensure proper structure and compute per-item vat_amount
     cleaned_items = []
     for item in validated["items"]:
         if isinstance(item, dict):
+            line_total = round(float(item.get("line_total", item.get("total", 0))), 2) if item.get("line_total") is not None or item.get("total") is not None else None
+            vat_rate = round(float(item["vat_rate"]), 1) if item.get("vat_rate") is not None else None
+
+            # Compute per-item VAT amount (assume tax-included, EU style)
+            vat_amount = None
+            if line_total is not None and vat_rate is not None and vat_rate > 0:
+                vat_amount = round(line_total - line_total / (1 + vat_rate / 100), 2)
+
             cleaned_item = {
                 "name": str(item.get("name", "")).strip() if item.get("name") else None,
                 "quantity": round(float(item["quantity"]), 2) if item.get("quantity") is not None else None,
                 "unit_price": round(float(item["unit_price"]), 2) if item.get("unit_price") is not None else None,
-                "line_total": round(float(item.get("line_total", item.get("total", 0))), 2) if item.get("line_total") is not None or item.get("total") is not None else None,
-                "vat_rate": round(float(item["vat_rate"]), 1) if item.get("vat_rate") is not None else None
+                "line_total": line_total,
+                "vat_rate": vat_rate,
+                "vat_amount": vat_amount,
             }
             cleaned_items.append(cleaned_item)
     validated["items"] = cleaned_items

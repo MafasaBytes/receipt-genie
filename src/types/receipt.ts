@@ -10,6 +10,7 @@ export interface ReceiptItem {
   unit_price: number | null;
   line_total: number | null;
   vat_rate: number | null;
+  vat_amount: number | null;
 }
 
 export interface Receipt {
