@@ -30,8 +30,8 @@ def pdf_to_images(pdf_path: Path, output_dir: Path) -> List[Path]:
         for page_num in range(len(pdf)):
             page = pdf.get_page(page_num)
             
-            # Render page to image (300 DPI for good quality)
-            bitmap = page.render(scale=300/72)  # 72 is default DPI
+            # Render page to image (200 DPI — good balance of quality vs size)
+            bitmap = page.render(scale=200/72)  # 72 is default DPI
             pil_image = bitmap.to_pil()
             
             # Save image
