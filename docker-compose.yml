@@ -1,0 +1,41 @@
+services:
+  app:
+    build: .
+    ports:
+      - "3000:80"
+    environment:
+      - OLLAMA_BASE_URL=http://ollama:11434
+      - OLLAMA_MODEL=llama3.2:latest
+      - DATABASE_URL=sqlite:///./data/receipt_scanner.db
+      - RAG_ENABLED=true
+    volumes:
+      # Persist the SQLite database and vector store across restarts
+      - receipt-data:/app/backend/data
+      - vector-store:/app/backend/vector_store
+    depends_on:
+      ollama:
+        condition: service_started
+    restart: unless-stopped
+
+  ollama:
+    image: ollama/ollama:latest
+    # Only expose if host Ollama is NOT running. Change to "11435:11434"
+    # or remove entirely if port 11434 is already taken.
+    ports:
+      - "11435:11434"
+    volumes:
+      - ollama-models:/root/.ollama
+    restart: unless-stopped
+    # Uncomment below for GPU passthrough (NVIDIA):
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: all
+    #           capabilities: [gpu]
+
+volumes:
+  receipt-data:
+  vector-store:
+  ollama-models:

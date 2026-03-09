@@ -232,7 +232,9 @@ function mapBackendReceiptsToFrontend(backendReceipts: any[]): Receipt[] {
       items: receipt.items || null,
       description,
       currency: receipt.currency || "EUR",
-      confidence_score: receipt.confidence_score || null
+      confidence_score: receipt.confidence_score || null,
+      items_verified: receipt.items_verified ?? null,
+      warnings: receipt.warnings ?? null
     };
   });
 }

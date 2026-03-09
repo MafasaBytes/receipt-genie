@@ -211,6 +211,8 @@ async def get_receipts(
             extraction_date=receipt.extraction_date,
             currency=metadata.get("currency"),
             vat_percentage=receipt.vat_percentage_effective or metadata.get("vat_percentage"),
+            items_verified=bool(receipt.items_verified) if receipt.items_verified is not None else metadata.get("items_verified"),
+            warnings=metadata.get("warnings", []),
             missing_fields=metadata.get("missing_fields")
         ))
     
@@ -424,6 +426,8 @@ async def update_receipt(
         extraction_date=receipt.extraction_date,
         currency=metadata.get("currency"),
         vat_percentage=receipt.vat_percentage_effective,  # Use effective VAT
+        items_verified=bool(receipt.items_verified) if receipt.items_verified is not None else metadata.get("items_verified"),
+        warnings=metadata.get("warnings", []),
         missing_fields=metadata.get("missing_fields")
     )
 

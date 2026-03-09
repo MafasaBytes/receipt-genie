@@ -16,9 +16,9 @@ pydantic-settings==2.5.2
 pypdfium2==4.30.0
 Pillow==11.0.0
 
-# Computer Vision (placeholders - install when ready)
-opencv-python==4.10.0.84
-numpy==1.26.4
+# Computer Vision
+opencv-python-headless>=4.10.0
+numpy>=1.26.4
 
 # OCR (placeholder - install when ready)
 # paddlepaddle==2.6.1

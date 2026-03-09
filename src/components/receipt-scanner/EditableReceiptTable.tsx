@@ -12,7 +12,13 @@ import {
 } from "@/components/ui/table";
 import { Input } from "@/components/ui/input";
 import { Button } from "@/components/ui/button";
-import { Save, Edit2, X, ChevronRight, ChevronDown } from "lucide-react";
+import { Save, Edit2, X, ChevronRight, ChevronDown, AlertTriangle } from "lucide-react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { toast } from "@/hooks/use-toast";
 
 interface EditableReceiptTableProps {
@@ -336,7 +342,24 @@ export function EditableReceiptTable({ receipts, onReceiptUpdate }: EditableRece
                     {renderEditableCell(receipt.id, 'date', formatDate(receipt.date), 'date')}
                   </TableCell>
                   <TableCell className="font-medium">
-                    {renderEditableCell(receipt.id, 'total_amount', receipt.total_amount, 'number')}
+                    <span className="inline-flex items-center gap-1">
+                      {renderEditableCell(receipt.id, 'total_amount', receipt.total_amount, 'number')}
+                      {receipt.items_verified === false && (
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <AlertTriangle className="h-3.5 w-3.5 text-amber-500 flex-shrink-0" />
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              <p className="text-xs max-w-xs">
+                                {receipt.warnings?.find((w) => w.includes("items_total_mismatch")) ||
+                                  "Item totals do not match receipt total"}
+                              </p>
+                            </TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      )}
+                    </span>
                   </TableCell>
                   <TableCell className="text-muted-foreground">
                     {renderVatSummary(receipt)}

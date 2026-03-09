@@ -482,8 +482,47 @@ def reconcile_vat_and_items(extracted: Dict[str, Any], ocr_text: str = "") -> Di
                 "vat_rate": vat_rate,
                 "vat_amount": vat_amount,
             }
+
+            # Per-item math validation: qty * unit_price should ≈ line_total
+            qty = cleaned_item["quantity"]
+            uprice = cleaned_item["unit_price"]
+            lt = cleaned_item["line_total"]
+            if qty is not None and uprice is not None and lt is not None:
+                expected = round(qty * uprice, 2)
+                if abs(expected - lt) > 0.02:
+                    warnings.append(
+                        f"item_math_corrected: '{cleaned_item['name']}' "
+                        f"qty({qty})*price({uprice})={expected} != line_total({lt})"
+                    )
+                    cleaned_item["line_total"] = expected
+                    # Recompute vat_amount with corrected line_total
+                    if vat_rate is not None and vat_rate > 0:
+                        cleaned_item["vat_amount"] = round(
+                            expected - expected / (1 + vat_rate / 100), 2
+                        )
+
             cleaned_items.append(cleaned_item)
     validated["items"] = cleaned_items
+
+    # --- Item-total reconciliation ---
+    items_with_total = [it for it in cleaned_items if it.get("line_total") is not None]
+    total_amount = validated.get("total_amount")
+    if items_with_total and total_amount is not None:
+        try:
+            items_sum = round(sum(it["line_total"] for it in items_with_total), 2)
+            diff = abs(items_sum - float(total_amount))
+            tolerance = max(float(total_amount) * 0.05, 0.50)
+            if diff <= tolerance:
+                validated["items_verified"] = True
+            else:
+                validated["items_verified"] = False
+                warnings.append(
+                    f"items_total_mismatch: sum={items_sum} vs total={total_amount} (diff={round(diff, 2)})"
+                )
+        except (ValueError, TypeError):
+            validated["items_verified"] = None
+    else:
+        validated["items_verified"] = None
     
     # Extract or build VAT breakdown
     vat_breakdown = []

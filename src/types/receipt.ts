@@ -26,6 +26,8 @@ export interface Receipt {
   description: string | null;
   currency: string | null;
   confidence_score?: number | null;
+  items_verified?: boolean | null;
+  warnings?: string[] | null;
   modified?: boolean;
 }
 

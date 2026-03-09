@@ -1,0 +1,14 @@
+node_modules
+dist
+backend/env
+backend/__pycache__
+backend/**/__pycache__
+backend/temp/*
+backend/exports/*
+backend/vector_store/*
+backend/*.db
+*.db
+.git
+.env
+*.pyc
+*.pyo

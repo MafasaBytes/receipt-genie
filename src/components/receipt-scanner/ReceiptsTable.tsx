@@ -9,7 +9,13 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
-import { ChevronRight, ChevronDown } from "lucide-react";
+import { ChevronRight, ChevronDown, AlertTriangle } from "lucide-react";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 interface ReceiptsTableProps {
   receipts: Receipt[];
@@ -126,7 +132,24 @@ export function ReceiptsTable({ receipts }: ReceiptsTableProps) {
                     {formatDate(receipt.date)}
                   </TableCell>
                   <TableCell className="font-medium">
-                    {formatCurrency(receipt.total_amount, receipt.currency)}
+                    <span className="inline-flex items-center gap-1">
+                      {formatCurrency(receipt.total_amount, receipt.currency)}
+                      {receipt.items_verified === false && (
+                        <TooltipProvider>
+                          <Tooltip>
+                            <TooltipTrigger asChild>
+                              <AlertTriangle className="h-3.5 w-3.5 text-amber-500 inline-block" />
+                            </TooltipTrigger>
+                            <TooltipContent>
+                              <p className="text-xs max-w-xs">
+                                {receipt.warnings?.find((w) => w.includes("items_total_mismatch")) ||
+                                  "Item totals do not match receipt total"}
+                              </p>
+                            </TooltipContent>
+                          </Tooltip>
+                        </TooltipProvider>
+                      )}
+                    </span>
                   </TableCell>
                   <TableCell className="text-muted-foreground">
                     {renderVatSummary(receipt)}

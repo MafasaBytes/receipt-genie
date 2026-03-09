@@ -116,44 +116,57 @@ def add_missing_field_metadata(extracted_fields: Dict[str, Any], confidence_scor
 def calculate_confidence_score(extracted_fields: Dict[str, Any], llm_success: bool, ocr_text: str) -> float:
     """
     Calculate confidence score based on extraction quality.
-    
+
     Factors:
-    - LLM extraction success (40%)
-    - Number of fields extracted (40%)
-    - OCR text quality (20%)
-    
+    - LLM extraction success (35%)
+    - Key fields present (30%)
+    - OCR text quality (15%)
+    - Item quality (20%)
+
     Returns: float between 0.0 and 1.0
     """
     score = 0.0
-    
-    # Factor 1: LLM extraction success (40%)
+
+    # Factor 1: LLM extraction success (35%)
     if llm_success:
-        score += 0.4
-    # If LLM failed, we get 0 for this factor
-    
-    # Factor 2: Number of fields extracted (40%)
-    # Key fields: merchant_name, date, total_amount, tax_amount, currency
+        score += 0.35
+
+    # Factor 2: Key fields present (30%)
     key_fields = ["merchant_name", "date", "total_amount", "tax_amount", "currency"]
     extracted_count = sum(1 for field in key_fields if extracted_fields.get(field) is not None)
-    field_score = (extracted_count / len(key_fields)) * 0.4
+    field_score = (extracted_count / len(key_fields)) * 0.30
     score += field_score
-    
-    # Factor 3: OCR text quality (20%)
-    # Based on text length and character diversity
+
+    # Factor 3: OCR text quality (15%)
     if ocr_text and len(ocr_text.strip()) > 0:
         text_length = len(ocr_text.strip())
-        # Good OCR should have at least 50 characters
         if text_length >= 50:
-            # Check for character diversity (not just repeated characters)
             unique_chars = len(set(ocr_text.strip().lower()))
-            if unique_chars >= 10:  # At least 10 different characters
-                score += 0.2
+            if unique_chars >= 10:
+                score += 0.15
             elif unique_chars >= 5:
-                score += 0.1
+                score += 0.075
         elif text_length >= 20:
-            score += 0.1
-    
-    # Ensure score is between 0.0 and 1.0
+            score += 0.075
+
+    # Factor 4: Item quality (20%)
+    items = extracted_fields.get("items") or []
+    if isinstance(items, list) and len(items) > 0:
+        # Items exist and non-empty: +10%
+        score += 0.10
+        # items_verified == True: +8%
+        if extracted_fields.get("items_verified") is True:
+            score += 0.08
+        # Item completeness (have both name + line_total): up to +2%
+        if items:
+            complete = sum(1 for it in items if isinstance(it, dict) and it.get("name") and it.get("line_total") is not None)
+            completeness_ratio = complete / len(items)
+            score += completeness_ratio * 0.02
+        # Penalty: >10 items loses 0.5%/item, capped at -4%
+        if len(items) > 10:
+            penalty = min((len(items) - 10) * 0.005, 0.04)
+            score -= penalty
+
     return max(0.0, min(1.0, score))
 
 def is_image_file(file_path: Path) -> bool:
@@ -516,12 +529,18 @@ def _extract_single_receipt(
     items_list = extracted_fields.get("items") or []
     if not isinstance(items_list, list):
         items_list = []
+    # Collect warnings from extraction
+    extraction_warnings = extracted_fields.get("_warnings", [])
+    items_verified = extracted_fields.get("items_verified")
+
     items_json = json.dumps({
         "items": items_list,
         "_metadata": {
             "currency": extracted_fields.get("currency"),
             "vat_percentage": extracted_fields.get("vat_percentage_effective"),
             "missing_fields": missing_metadata,
+            "items_verified": items_verified,
+            "warnings": extraction_warnings,
         },
     })
 
@@ -545,6 +564,7 @@ def _extract_single_receipt(
         image_path=source_path,
         confidence_score=confidence_score,
         is_credit=1 if extracted_fields.get("is_credit") else 0,
+        items_verified=1 if items_verified is True else (0 if items_verified is False else None),
     )
     db.add(db_receipt)
     db.commit()
@@ -590,6 +610,8 @@ def _extract_single_receipt(
         "currency": meta.get("currency") or extracted_fields.get("currency"),
         "vat_percentage": db_receipt.vat_percentage_effective,
         "is_credit": bool(db_receipt.is_credit),
+        "items_verified": items_verified,
+        "warnings": extraction_warnings,
         "missing_fields": meta.get("missing_fields") or missing_metadata,
     }
 
