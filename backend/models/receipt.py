@@ -65,6 +65,7 @@ class ReceiptResponse(BaseModel):
     extraction_date: Optional[datetime] = None
     currency: Optional[str] = None
     vat_percentage: Optional[float] = None  # Legacy field, maps to vat_percentage_effective
+    is_credit: Optional[bool] = False
     missing_fields: Optional[Dict[str, Any]] = None  # Metadata for missing fields
     
     class Config:
@@ -137,4 +138,5 @@ class ReceiptUpdate(BaseModel):
     vat_breakdown: Optional[List[Dict[str, Any]]] = None
     vat_percentage: Optional[float] = None
     currency: Optional[str] = None
+    is_credit: Optional[bool] = False
 

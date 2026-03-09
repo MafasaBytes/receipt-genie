@@ -45,6 +45,7 @@ class Receipt(Base):
     address = Column(String(500), nullable=True)
     phone = Column(String(50), nullable=True)
     raw_text = Column(Text, nullable=True)  # Full OCR text
+    is_credit = Column(Integer, default=0, nullable=False)  # 0=normal, 1=credit/return
     
     # Processing metadata
     image_path = Column(String(500), nullable=True)  # Path to cropped receipt image

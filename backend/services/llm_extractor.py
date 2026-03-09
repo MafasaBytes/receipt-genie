@@ -326,22 +326,58 @@ def parse_vat_lines(ocr_text: str) -> List[Dict[str, Any]]:
         List of VAT breakdown entries with vat_rate and tax_amount
     """
     patterns = [
+        # Dutch BTW laag/hoog patterns (highest priority)
+        r"BTW\s+(?:laag|hoog|low|high)\s*(\d{1,2})[.,]?(\d)?%\s+€?\s*(\d+[.,]\d{2})",
+        r"BTW\s+([A-Z])\s+(\d{1,2}(?:[.,]\d{1,2})?)%\s+€?\s*(\d+[.,]\d{2})",
+        # General VAT patterns
         r"(VAT|BTW|TVA|IVA|MwSt)\s*(\d{1,2}(?:[.,]\d)?)%\s*([0-9.,]+)",
         r"(\d{1,2}(?:[.,]\d)?)%\s*([0-9.,]+)",
         r"(VAT|BTW|TVA|IVA|MwSt)\s*(\d{1,2}(?:[.,]\d)?)%",
     ]
     results = []
-    
-    for pat in patterns:
+    matched_spans = set()  # Track matched text positions to avoid duplicates
+
+    for pat_idx, pat in enumerate(patterns):
         for m in re.finditer(pat, ocr_text, flags=re.IGNORECASE):
+            # Skip if this text region was already matched by a higher-priority pattern
+            span = m.span()
+            if any(s[0] <= span[0] and s[1] >= span[1] for s in matched_spans):
+                continue
+            if any(span[0] <= s[0] and span[1] >= s[1] for s in matched_spans):
+                continue
+            # Also skip if spans overlap significantly
+            if any(max(span[0], s[0]) < min(span[1], s[1]) for s in matched_spans):
+                continue
+
             try:
+                # Dutch BTW laag/hoog pattern: groups = (rate_int, rate_decimal_or_None, amount)
+                if pat_idx == 0:
+                    rate_str = m.group(1)
+                    if m.group(2):
+                        rate_str += "." + m.group(2)
+                    amount_str = m.group(3)
+                    rate = float(rate_str.replace(',', '.'))
+                    amount = float(amount_str.replace(',', '.').replace(' ', ''))
+                    results.append({"vat_rate": round(rate, 1), "tax_amount": round(amount, 2)})
+                    matched_spans.add(span)
+                    continue
+
+                # Dutch BTW letter-code pattern: groups = (letter, rate, amount)
+                if pat_idx == 1:
+                    rate_str = m.group(2)
+                    amount_str = m.group(3)
+                    rate = float(rate_str.replace(',', '.'))
+                    amount = float(amount_str.replace(',', '.').replace(' ', ''))
+                    results.append({"vat_rate": round(rate, 1), "tax_amount": round(amount, 2)})
+                    matched_spans.add(span)
+                    continue
+
+                # General patterns
                 if len(m.groups()) >= 2:
-                    # Pattern 1: VAT 21% 1.68 or Pattern 2: 21% 1.68
                     if len(m.groups()) == 3:
                         rate_str = m.group(2)
                         amount_str = m.group(3)
                     elif len(m.groups()) == 2:
-                        # Could be rate then amount, or just rate
                         if '%' in m.group(1):
                             rate_str = m.group(1).replace('%', '')
                             amount_str = m.group(2) if len(m.groups()) > 1 else None
@@ -350,13 +386,14 @@ def parse_vat_lines(ocr_text: str) -> List[Dict[str, Any]]:
                             amount_str = m.group(2)
                     else:
                         continue
-                    
+
                     rate = float(rate_str.replace(',', '.'))
                     if amount_str:
                         amount = float(amount_str.replace(',', '.').replace(' ', ''))
                         results.append({"vat_rate": round(rate, 1), "tax_amount": round(amount, 2)})
                     else:
                         results.append({"vat_rate": round(rate, 1), "tax_amount": None})
+                    matched_spans.add(span)
             except (ValueError, IndexError):
                 continue
     
@@ -386,7 +423,41 @@ def reconcile_vat_and_items(extracted: Dict[str, Any], ocr_text: str = "") -> Di
     """
     validated = extracted.copy()
     warnings = []
-    
+
+    # --- Credit / return receipt detection ---
+    is_credit = bool(extracted.get("is_credit"))
+
+    # Auto-detect from negative total_amount
+    total_raw = validated.get("total_amount")
+    if total_raw is not None:
+        try:
+            if float(total_raw) < 0:
+                is_credit = True
+                validated["total_amount"] = abs(float(total_raw))
+        except (ValueError, TypeError):
+            pass
+
+    # Auto-detect from OCR keywords
+    if not is_credit and ocr_text:
+        credit_pattern = re.compile(
+            r"\b(retour|credit|restitutie|refund|creditnota)\b", re.IGNORECASE
+        )
+        if credit_pattern.search(ocr_text):
+            is_credit = True
+            warnings.append("Credit receipt detected via OCR keywords")
+
+    # Flip negative tax_amount / subtotal to positive
+    for field in ("tax_amount", "subtotal"):
+        val = validated.get(field)
+        if val is not None:
+            try:
+                if float(val) < 0:
+                    validated[field] = abs(float(val))
+            except (ValueError, TypeError):
+                pass
+
+    validated["is_credit"] = is_credit
+
     # Ensure items list exists
     if "items" not in validated or not isinstance(validated["items"], list):
         validated["items"] = []
@@ -418,12 +489,12 @@ def reconcile_vat_and_items(extracted: Dict[str, Any], ocr_text: str = "") -> Di
                     "base_amount": round(float(entry["base_amount"]), 2) if entry.get("base_amount") is not None else None
                 })
     
-    # If no vat_breakdown from LLM, try regex fallback
-    if not vat_breakdown and ocr_text:
+    # If LLM returned ≤1 VAT entry, try regex — prefer regex when it finds more rates
+    if len(vat_breakdown) <= 1 and ocr_text:
         regex_vat = parse_vat_lines(ocr_text)
-        if regex_vat:
+        if len(regex_vat) > len(vat_breakdown):
             vat_breakdown = regex_vat
-            warnings.append("VAT breakdown extracted via regex fallback")
+            warnings.append("VAT breakdown upgraded via regex (more rates found)")
     
     # If still no breakdown, try to infer from items
     if not vat_breakdown and validated["items"]:
@@ -700,6 +771,10 @@ def validate_extracted_fields(data: Dict[str, Any]) -> Dict[str, Any]:
                     "base_amount": float(entry["base_amount"]) if entry.get("base_amount") is not None else None,
                 })
     
+    # Extract is_credit flag
+    if data.get("is_credit"):
+        validated["is_credit"] = True
+
     # Extract optional fields
     for field in ["payment_method", "address", "phone"]:
         if field in data and data[field]:

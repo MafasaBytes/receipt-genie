@@ -97,6 +97,7 @@ async def export_csv(
 
         data.append({
             "Receipt Number": receipt.receipt_number,
+            "Credit": "Yes" if getattr(receipt, "is_credit", 0) else "No",
             "Store Name": receipt.merchant_name or "",
             "Date": receipt.date or "",
             "Subtotal": receipt.subtotal or 0.0,
@@ -112,10 +113,10 @@ async def export_csv(
             "Confidence Score": receipt.confidence_score or 0.0,
             "Extraction Date": receipt.extraction_date.isoformat() if receipt.extraction_date else ""
         })
-    
+
     # Create DataFrame
     df = pd.DataFrame(data)
-    
+
     # Save to CSV
     export_dir = ensure_export_dir()
     csv_path = export_dir / f"{file_id}_receipts.csv"
@@ -202,6 +203,7 @@ async def export_excel(
 
         data.append({
             "Receipt Number": receipt.receipt_number,
+            "Credit": "Yes" if getattr(receipt, "is_credit", 0) else "No",
             "Store Name": receipt.merchant_name or "",
             "Date": receipt.date or "",
             "Subtotal": receipt.subtotal or 0.0,
@@ -217,10 +219,10 @@ async def export_excel(
             "Confidence Score": receipt.confidence_score or 0.0,
             "Extraction Date": receipt.extraction_date.isoformat() if receipt.extraction_date else ""
         })
-    
+
     # Create DataFrame
     df = pd.DataFrame(data)
-    
+
     # Save to Excel
     export_dir = ensure_export_dir()
     excel_path = export_dir / f"{file_id}_receipts.xlsx"

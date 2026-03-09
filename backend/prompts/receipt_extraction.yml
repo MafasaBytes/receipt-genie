@@ -56,6 +56,8 @@ prompt:
         }
       ],
 
+      "is_credit": boolean,                    // true if return/credit/refund receipt
+
       "payment_method": "string or null",      // e.g. CASH, CARD, VISA, MASTERCARD
       "address": "string or null",
       "phone": "string or null"
@@ -68,6 +70,7 @@ prompt:
     - If receipt totals are tax-included, compute base amounts using base = total / (1 + rate/100).
     - If receipt totals are tax-excluded, compute tax = base * (rate/100).
     - If only one VAT rate is visible, still return a single vat_breakdown entry.
+    - If the receipt is a return/credit/refund (negative total, 'retour', 'credit', 'restitutie'), set is_credit to true. Keep all amounts as positive absolute values.
     - When in doubt between multiple interpretations, prefer the one that keeps totals internally consistent.
     - If dates or currencies are ambiguous, keep them as null instead of guessing.
     - If REFERENCE EXAMPLES are provided above, use them as style and format guidance

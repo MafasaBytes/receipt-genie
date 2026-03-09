@@ -544,6 +544,7 @@ def _extract_single_receipt(
         raw_text=ocr_text,
         image_path=source_path,
         confidence_score=confidence_score,
+        is_credit=1 if extracted_fields.get("is_credit") else 0,
     )
     db.add(db_receipt)
     db.commit()
@@ -588,6 +589,7 @@ def _extract_single_receipt(
         "extraction_date": db_receipt.extraction_date,
         "currency": meta.get("currency") or extracted_fields.get("currency"),
         "vat_percentage": db_receipt.vat_percentage_effective,
+        "is_credit": bool(db_receipt.is_credit),
         "missing_fields": meta.get("missing_fields") or missing_metadata,
     }
 
